@@ -7,7 +7,7 @@
     "xlsx": "^0.18.5"
   },
   "engines": {
-    "node": "18.x"
+    "node": "24.x"
   },
   "scripts": {
     "build": "echo \"no build\"",
