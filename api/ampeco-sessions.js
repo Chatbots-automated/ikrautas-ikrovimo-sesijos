@@ -2,6 +2,8 @@
 // Vercel Serverless Function (Node runtime)
 // - JSON for n8n by default
 // - ?format=xlsx returns an Excel file with 3 tabs (one per station)
+// Excel tabs contain ONLY: id, energy_kwh, startedAt, stoppedAt, tarifas
+// If a station has no sessions/periods in the month -> still outputs 1 row with tarifas="NO SESSIONS"
 
 const XLSX = require("xlsx");
 
@@ -21,8 +23,6 @@ function toIsoLocalMonthRangeEuropeVilnius(now = new Date()) {
   // Default range: current month in Europe/Vilnius
   // startedAfter = first day 00:00:00
   // startedBefore = first day of next month 00:00:00
-  // NOTE: we output WITHOUT timezone suffix; AMPECO accepts ISO strings either way,
-  // but you can pass exact strings via query params to override.
   const tz = "Europe/Vilnius";
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: tz,
@@ -52,14 +52,8 @@ function safeNum(x) {
   return Number.isFinite(n) ? n : null;
 }
 
-function whToKwh(wh) {
-  const n = safeNum(wh);
-  return n === null ? null : n / 1000;
-}
-
 function buildSessionsUrl({
   baseUrl,
-  token,
   chargePointId,
   startedAfter,
   startedBefore,
@@ -69,7 +63,7 @@ function buildSessionsUrl({
 }) {
   const url = new URL("/public-api/resources/sessions/v1.0", baseUrl);
 
-  // Expansions/flags (matching your curl)
+  // Expansions/flags
   url.searchParams.set("withClockAlignedEnergyConsumption", "true");
   url.searchParams.set("clockAlignedInterval", String(clockAlignedInterval));
   url.searchParams.set("withAuthorization", "true");
@@ -89,8 +83,7 @@ function buildSessionsUrl({
   return url.toString();
 }
 
-// Best-effort (docs page is hard to fetch via this environment, but endpoint naming follows AMPECO conventions)
-// If it 404s on your tenant, we just skip enrichment and keep listing payload.
+// Best-effort enrichment endpoint (if it 404s, we ignore it)
 function buildConsumptionStatsUrl({ baseUrl, sessionId, clockAlignedInterval }) {
   const url = new URL(
     `/public-api/resources/sessions/v1.0/${encodeURIComponent(
@@ -115,7 +108,7 @@ async function ampecoGetJson(url, token) {
   let json;
   try {
     json = text ? JSON.parse(text) : null;
-  } catch (e) {
+  } catch {
     json = { _raw: text };
   }
 
@@ -147,7 +140,6 @@ async function listAllSessionsForStation({
   while (true) {
     const url = buildSessionsUrl({
       baseUrl,
-      token,
       chargePointId,
       startedAfter,
       startedBefore,
@@ -175,7 +167,6 @@ async function enrichActiveSessionsConsumptionStats({
   sessions,
   clockAlignedInterval,
 }) {
-  // Only enrich actives (and also if listing returned a suspiciously large clockAligned array)
   const enriched = [];
   for (const s of sessions) {
     const status = String(s?.status || "");
@@ -199,11 +190,6 @@ async function enrichActiveSessionsConsumptionStats({
       });
       const stats = await ampecoGetJson(url, token);
 
-      // We don’t know the exact response shape on your tenant/version,
-      // so we try common patterns:
-      // - { data: [...] }
-      // - { clockAlignedEnergyConsumption: [...] }
-      // - { data: { clockAlignedEnergyConsumption: [...] } }
       const clock =
         (Array.isArray(stats?.data) && stats.data) ||
         (Array.isArray(stats?.clockAlignedEnergyConsumption) &&
@@ -212,13 +198,9 @@ async function enrichActiveSessionsConsumptionStats({
           stats.data.clockAlignedEnergyConsumption) ||
         null;
 
-      if (clock) {
-        enriched.push({ ...s, _consumptionStatsClockAligned: clock });
-      } else {
-        enriched.push(s);
-      }
-    } catch (e) {
-      // If the endpoint is not available or errors → keep original session
+      if (clock) enriched.push({ ...s, _consumptionStatsClockAligned: clock });
+      else enriched.push(s);
+    } catch {
       enriched.push(s);
     }
   }
@@ -226,16 +208,14 @@ async function enrichActiveSessionsConsumptionStats({
 }
 
 function normalizeSessionsForN8n({ station, sessions, clockAlignedInterval }) {
-  return sessions.map((s) => {
+  return (sessions || []).map((s) => {
     const clockFromListing = Array.isArray(s?.clockAlignedEnergyConsumption)
       ? s.clockAlignedEnergyConsumption
       : [];
-
     const clockFromStats = Array.isArray(s?._consumptionStatsClockAligned)
       ? s._consumptionStatsClockAligned
       : [];
 
-    // Prefer consumption-stats clockAligned if present (especially for active)
     const clockAligned =
       clockFromStats.length > 0 ? clockFromStats : clockFromListing;
 
@@ -251,32 +231,10 @@ function normalizeSessionsForN8n({ station, sessions, clockAlignedInterval }) {
       stoppedAt: s?.stoppedAt ?? null,
       lastUpdatedAt: s?.lastUpdatedAt ?? null,
 
-      evseId: s?.evseId ?? null,
-      evsePhysicalReference: s?.evsePhysicalReference ?? null,
-
-      authorizationId: s?.authorizationId ?? null,
-      authorization: s?.authorization ?? null,
-
-      idTag: s?.idTag ?? null,
-      idTagLabel: s?.idTagLabel ?? null,
-
+      // Keep these for JSON/debug/optional usage
       energyWh: safeNum(s?.energy),
-      energyKwh: whToKwh(s?.energy),
-
       energyConsumptionTotalWh: safeNum(s?.energyConsumption?.total),
       energyConsumptionGridWh: safeNum(s?.energyConsumption?.grid),
-
-      totalAmountWithTax: safeNum(s?.totalAmount?.withTax),
-      totalAmountWithoutTax: safeNum(s?.totalAmount?.withoutTax),
-      currency: s?.currency ?? null,
-
-      billingStatus: s?.billingStatus ?? null,
-      paymentType: s?.paymentType ?? null,
-      paymentMethodId: s?.paymentMethodId ?? null,
-
-      powerLatest: safeNum(s?.power?.latest),
-      powerPeak: safeNum(s?.power?.peak),
-      powerAverage: safeNum(s?.power?.average),
 
       chargingPeriods: Array.isArray(s?.chargingPeriods) ? s.chargingPeriods : [],
       clockAlignedIntervalMinutes: clockAlignedInterval,
@@ -285,76 +243,132 @@ function normalizeSessionsForN8n({ station, sessions, clockAlignedInterval }) {
   });
 }
 
-function makeExcel({ stationNormalized }) {
-  // 3 tabs: one per station
-  // Each sheet contains CLOCK-ALIGNED rows (most useful for reporting)
+/* -----------------------------
+   TARIFAS logic (from your image)
+   - Weekend (Sat/Sun) always Naktinis
+   - Weekdays:
+     Summer time: Dieninis 08:00–24:00, Naktinis 00:00–08:00
+     Winter time: Dieninis 07:00–23:00, Naktinis 23:00–07:00
+   Detected by Vilnius timezone offset (+03 summer, +02 winter)
+-------------------------------- */
+
+const VILNIUS_TZ = "Europe/Vilnius";
+
+function vilniusParts(date) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: VILNIUS_TZ,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+    timeZoneName: "shortOffset", // "GMT+2"/"GMT+3"
+  }).formatToParts(date);
+
+  const get = (t) => parts.find((p) => p.type === t)?.value;
+
+  return {
+    year: get("year"),
+    month: get("month"),
+    day: get("day"),
+    hour: Number(get("hour")),
+    minute: Number(get("minute")),
+    second: Number(get("second")),
+    tzOffset: get("timeZoneName") || "GMT+0",
+  };
+}
+
+function offsetToHHMM(tzOffsetStr) {
+  const m = String(tzOffsetStr).match(/GMT([+-])(\d{1,2})(?::(\d{2}))?/);
+  if (!m) return "+00:00";
+  const sign = m[1];
+  const hh = String(m[2]).padStart(2, "0");
+  const mm = String(m[3] || "00").padStart(2, "0");
+  return `${sign}${hh}:${mm}`;
+}
+
+function toVilniusIsoWithOffset(isoString) {
+  if (!isoString) return "";
+  const d = new Date(isoString);
+  const p = vilniusParts(d);
+  const off = offsetToHHMM(p.tzOffset);
+  return `${p.year}-${p.month}-${p.day}T${String(p.hour).padStart(2, "0")}:${String(
+    p.minute
+  ).padStart(2, "0")}:${String(p.second).padStart(2, "0")}${off}`;
+}
+
+function weekdayVilnius(date) {
+  const w = new Intl.DateTimeFormat("en-US", {
+    timeZone: VILNIUS_TZ,
+    weekday: "short",
+  }).format(date);
+  const map = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 };
+  return map[w] || 0;
+}
+
+function isSummerTimeVilnius(date) {
+  const p = vilniusParts(date);
+  const off = offsetToHHMM(p.tzOffset);
+  return off === "+03:00";
+}
+
+function tarifasFromVilniusTime(isoString) {
+  if (!isoString) return "";
+  const d = new Date(isoString);
+
+  const wd = weekdayVilnius(d); // 1..7
+  if (wd === 6 || wd === 7) return "Naktinis"; // VI–VII
+
+  const p = vilniusParts(d);
+  const t = p.hour * 60 + p.minute;
+
+  const summer = isSummerTimeVilnius(d);
+  const dayStart = (summer ? 8 : 7) * 60;
+  const dayEnd = (summer ? 24 : 23) * 60;
+
+  const isDay = t >= dayStart && t < Math.min(dayEnd, 1440);
+  return isDay ? "Dieninis" : "Naktinis";
+}
+
+/* -----------------------------
+   Excel builder (chargingPeriods only)
+   Columns: id, energy_kwh, startedAt, stoppedAt, tarifas
+   If station has no periods -> 1 row with tarifas="NO SESSIONS"
+-------------------------------- */
+
+function makeExcelPeriodsOnly({ stationNormalized }) {
   const wb = XLSX.utils.book_new();
 
   for (const st of stationNormalized) {
     const rows = [];
 
-    for (const sess of st.sessions) {
-      const clock = Array.isArray(sess.clockAlignedEnergyConsumption)
-        ? sess.clockAlignedEnergyConsumption
-        : [];
-
-      if (clock.length === 0) {
+    for (const sess of st.sessions || []) {
+      const periods = Array.isArray(sess.chargingPeriods) ? sess.chargingPeriods : [];
+      for (const p of periods) {
+        const energyWh = Number(p?.energy ?? 0);
         rows.push({
-          stationName: sess.stationName,
-          chargePointId: sess.chargePointId,
-          sessionId: sess.sessionId,
-          status: sess.status,
-          startedAt: sess.startedAt,
-          stoppedAt: sess.stoppedAt,
-          periodStart: null,
-          periodEnd: null,
-          energyConsumedWh: null,
-          energyConsumedKwh: null,
-          gridWh: null,
-          gridKwh: null,
-          totalCostWithTax: null,
-          totalCostWithoutTax: null,
-          sessionEnergyWh: sess.energyWh,
-          sessionEnergyKwh: sess.energyKwh,
-          sessionTotalWithTax: sess.totalAmountWithTax,
-          sessionTotalWithoutTax: sess.totalAmountWithoutTax,
-          currency: sess.currency,
-        });
-        continue;
-      }
-
-      for (const p of clock) {
-        const eWh =
-          safeNum(p?.energyConsumed) ??
-          safeNum(p?.energyConsumption?.total) ??
-          null;
-        const gWh = safeNum(p?.energyConsumption?.grid) ?? null;
-
-        rows.push({
-          stationName: sess.stationName,
-          chargePointId: sess.chargePointId,
-          sessionId: sess.sessionId,
-          status: sess.status,
-          startedAt: sess.startedAt,
-          stoppedAt: sess.stoppedAt,
-          periodStart: p?.start ?? null,
-          periodEnd: p?.end ?? null,
-          energyConsumedWh: eWh,
-          energyConsumedKwh: eWh === null ? null : eWh / 1000,
-          gridWh: gWh,
-          gridKwh: gWh === null ? null : gWh / 1000,
-          totalCostWithTax: safeNum(p?.totalCost?.withTax),
-          totalCostWithoutTax: safeNum(p?.totalCost?.withoutTax),
-          sessionEnergyWh: sess.energyWh,
-          sessionEnergyKwh: sess.energyKwh,
-          sessionTotalWithTax: sess.totalAmountWithTax,
-          sessionTotalWithoutTax: sess.totalAmountWithoutTax,
-          currency: sess.currency,
+          id: p?.id ?? "",
+          energy_kwh: Number.isFinite(energyWh) ? +(energyWh / 1000).toFixed(6) : "",
+          startedAt: toVilniusIsoWithOffset(p?.startedAt),
+          stoppedAt: toVilniusIsoWithOffset(p?.stoppedAt),
+          tarifas: tarifasFromVilniusTime(p?.startedAt),
         });
       }
     }
 
-    const sheetName = String(st.stationName).slice(0, 31); // Excel sheet name limit
+    if (rows.length === 0) {
+      rows.push({
+        id: "",
+        energy_kwh: "",
+        startedAt: "",
+        stoppedAt: "",
+        tarifas: "NO SESSIONS",
+      });
+    }
+
+    const sheetName = String(st.stationName).slice(0, 31);
     const ws = XLSX.utils.json_to_sheet(rows);
     XLSX.utils.book_append_sheet(wb, ws, sheetName);
   }
@@ -364,7 +378,7 @@ function makeExcel({ stationNormalized }) {
 
 module.exports = async (req, res) => {
   try {
-    // Optional internal protection (recommended)
+    // Optional internal protection
     const internalKey = process.env.INTERNAL_API_KEY;
     if (internalKey) {
       const got =
@@ -390,10 +404,7 @@ module.exports = async (req, res) => {
     const clockAlignedInterval = Number(req.query.clockAlignedInterval || 15);
     const format = String(req.query.format || "json").toLowerCase();
 
-    const perPage = Math.min(
-      100,
-      Math.max(1, Number(req.query.per_page || 100))
-    );
+    const perPage = Math.min(100, Math.max(1, Number(req.query.per_page || 100)));
 
     const stationResults = [];
     let totalSessions = 0;
@@ -432,90 +443,22 @@ module.exports = async (req, res) => {
       });
     }
 
-    if (totalSessions === 0) {
-      // Must explicitly say no sessions
-      const payload = {
-        ok: true,
-        noSessions: true,
-        message: "There were no sessions in the selected period.",
-        generatedAt: new Date().toISOString(),
-        range: { startedAfter, startedBefore, clockAlignedInterval },
-        stations: stationResults,
-      };
-
-      if (format === "xlsx") {
-        // Generate a minimal Excel file too
-        const wb = XLSX.utils.book_new();
-        const ws = XLSX.utils.json_to_sheet([
-          {
-            message: payload.message,
-            startedAfter,
-            startedBefore,
-            clockAlignedInterval,
-          },
-        ]);
-        XLSX.utils.book_append_sheet(wb, ws, "Info");
-        const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
-
-        res.setHeader(
-          "Content-Type",
-          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        );
-        res.setHeader(
-          "Content-Disposition",
-          `attachment; filename="ampeco_sessions_none.xlsx"`
-        );
-        return res.status(200).send(buf);
-      }
-
-      return res.status(200).json(payload);
-    }
-
-    // Combined flat arrays (handy for n8n)
-    const flatSessions = stationResults.flatMap((s) => s.sessions);
-    const flatClock = [];
-    for (const s of flatSessions) {
-      const clock = Array.isArray(s.clockAlignedEnergyConsumption)
-        ? s.clockAlignedEnergyConsumption
-        : [];
-      for (const p of clock) {
-        flatClock.push({
-          stationName: s.stationName,
-          chargePointId: s.chargePointId,
-          sessionId: s.sessionId,
-          status: s.status,
-          startedAt: s.startedAt,
-          stoppedAt: s.stoppedAt,
-          periodStart: p?.start ?? null,
-          periodEnd: p?.end ?? null,
-          energyConsumedWh:
-            safeNum(p?.energyConsumed) ??
-            safeNum(p?.energyConsumption?.total) ??
-            null,
-          gridWh: safeNum(p?.energyConsumption?.grid) ?? null,
-          totalCostWithTax: safeNum(p?.totalCost?.withTax),
-          totalCostWithoutTax: safeNum(p?.totalCost?.withoutTax),
-        });
-      }
-    }
-
+    // JSON payload for n8n (keep it structured + include periods)
     const payload = {
       ok: true,
-      noSessions: false,
-      message: "Sessions fetched successfully.",
       generatedAt: new Date().toISOString(),
       range: { startedAfter, startedBefore, clockAlignedInterval },
-      totals: {
-        sessions: totalSessions,
-        clockAlignedRows: flatClock.length,
-      },
+      totals: { sessions: totalSessions },
       stations: stationResults,
-      flatSessions,
-      flatClockAligned: flatClock,
+      noSessions: totalSessions === 0,
+      message:
+        totalSessions === 0
+          ? "There were no sessions in the selected period."
+          : "Sessions fetched successfully.",
     };
 
     if (format === "xlsx") {
-      const buf = makeExcel({ stationNormalized: stationResults });
+      const buf = makeExcelPeriodsOnly({ stationNormalized: stationResults });
 
       res.setHeader(
         "Content-Type",
@@ -523,7 +466,7 @@ module.exports = async (req, res) => {
       );
       res.setHeader(
         "Content-Disposition",
-        `attachment; filename="ampeco_sessions_${startedAfter.replace(
+        `attachment; filename="ampeco_periods_${startedAfter.replace(
           /[:+]/g,
           "-"
         )}_${startedBefore.replace(/[:+]/g, "-")}.xlsx"`
