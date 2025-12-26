@@ -2,11 +2,15 @@
   "name": "ampeco-sessions-vercel",
   "version": "1.0.0",
   "private": true,
-  "main": "api/ampeco-sessions.js",
+  "type": "commonjs",
   "dependencies": {
     "xlsx": "^0.18.5"
   },
   "engines": {
-    "node": ">=18"
+    "node": "18.x"
+  },
+  "scripts": {
+    "build": "echo \"no build\"",
+    "vercel-build": "echo \"no build\""
   }
 }
