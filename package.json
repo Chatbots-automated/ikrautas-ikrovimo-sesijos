@@ -10,7 +10,9 @@
     "node": "24.x"
   },
   "scripts": {
+    "dev": "vercel dev",
     "build": "echo \"no build\"",
-    "vercel-build": "echo \"no build\""
+    "vercel-build": "echo \"no build\"",
+    "start": "node -e \"console.log('functions-only project')\""
   }
 }
