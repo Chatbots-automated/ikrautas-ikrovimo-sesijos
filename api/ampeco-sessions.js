@@ -6,11 +6,17 @@
 //
 // Each station sheet has:
 // 1) DETAIL TABLE (columns): id, energy_kwh, startedAt, stoppedAt, tarifas
-//    - If no sessions/periods -> still outputs 1 row with tarifas="NO SESSIONS"
-// 2) MONTH SUMMARY TABLE (same sheet, below details):
+//    - If no rows -> still outputs 1 row with tarifas="NO SESSIONS"
+// 2) MONTH SUMMARY TABLE (same sheet, to the RIGHT, not below):
 //    - Month (YYYY-MM), Dieninis_kWh, Naktinis_kWh, Total_kWh, Rows
 //
-// Also adds charge point 171: "Aliaksandr Ciurlionio 84A"
+// IMPORTANT FIX for long-running ACTIVE sessions:
+// - Your previous code only fetched sessions where startedAt is inside the month.
+// - If a session started 5 months ago and is still active, it won’t be returned by filter[startedAfter].
+// - So now we ALSO fetch ACTIVE sessions without date filters (best-effort) and then slice their
+//   clock-aligned consumption to the requested month range.
+//
+// Stations include charge point 171: "Aliaksandr Ciurlionio 84A"
 //
 // ENV VARS:
 // - AMPECO_BEARER_TOKEN (required)
@@ -70,6 +76,7 @@ function buildSessionsUrl({
   clockAlignedInterval,
   cursor,
   perPage,
+  statusFilter, // optional "active"
 }) {
   const url = new URL("/public-api/resources/sessions/v1.0", baseUrl);
 
@@ -81,8 +88,13 @@ function buildSessionsUrl({
   url.searchParams.set("withChargingPeriodsPriceBreakdown", "true");
 
   url.searchParams.set("filter[chargePointId]", String(chargePointId));
-  url.searchParams.set("filter[startedAfter]", startedAfter);
-  url.searchParams.set("filter[startedBefore]", startedBefore);
+
+  // Only set date filters when provided
+  if (startedAfter) url.searchParams.set("filter[startedAfter]", String(startedAfter));
+  if (startedBefore) url.searchParams.set("filter[startedBefore]", String(startedBefore));
+
+  // Best-effort: many AMPECO tenants support this
+  if (statusFilter) url.searchParams.set("filter[status]", String(statusFilter));
 
   url.searchParams.set("per_page", String(perPage));
   url.searchParams.set("cursor", cursor === null ? "null" : String(cursor));
@@ -90,6 +102,7 @@ function buildSessionsUrl({
   return url.toString();
 }
 
+// Best-effort enrichment endpoint (if it 404s, we ignore it)
 function buildConsumptionStatsUrl({ baseUrl, sessionId, clockAlignedInterval }) {
   const url = new URL(
     `/public-api/resources/sessions/v1.0/${encodeURIComponent(
@@ -131,7 +144,7 @@ async function ampecoGetJson(url, token) {
   return json;
 }
 
-async function listAllSessionsForStation({
+async function listPagedSessions({
   baseUrl,
   token,
   chargePointId,
@@ -139,6 +152,7 @@ async function listAllSessionsForStation({
   startedBefore,
   clockAlignedInterval,
   perPage = 100,
+  statusFilter,
 }) {
   let cursor = null;
   const all = [];
@@ -152,6 +166,7 @@ async function listAllSessionsForStation({
       clockAlignedInterval,
       cursor,
       perPage,
+      statusFilter,
     });
 
     const resp = await ampecoGetJson(url, token);
@@ -165,6 +180,53 @@ async function listAllSessionsForStation({
   }
 
   return all;
+}
+
+async function listAllSessionsForStationInRange({
+  baseUrl,
+  token,
+  chargePointId,
+  startedAfter,
+  startedBefore,
+  clockAlignedInterval,
+  perPage = 100,
+}) {
+  return listPagedSessions({
+    baseUrl,
+    token,
+    chargePointId,
+    startedAfter,
+    startedBefore,
+    clockAlignedInterval,
+    perPage,
+  });
+}
+
+async function listActiveSessionsForStationBestEffort({
+  baseUrl,
+  token,
+  chargePointId,
+  clockAlignedInterval,
+  perPage = 100,
+}) {
+  // Some tenants support filter[status]=active.
+  // If not supported, we just return [] and proceed (no hard fail).
+  try {
+    const active = await listPagedSessions({
+      baseUrl,
+      token,
+      chargePointId,
+      startedAfter: null,
+      startedBefore: null,
+      clockAlignedInterval,
+      perPage,
+      statusFilter: "active",
+    });
+    return Array.isArray(active) ? active : [];
+  } catch (e) {
+    // Don't break the whole export if tenant doesn't support status filter
+    return [];
+  }
 }
 
 async function enrichActiveSessionsConsumptionStats({
@@ -243,7 +305,7 @@ function normalizeSessionsForN8n({ station, sessions, clockAlignedInterval }) {
 }
 
 /* -----------------------------
-   TARIFAS logic (from provided image)
+   TARIFAS logic (from your image)
    - Weekend (Sat/Sun): Naktinis all day
    - Weekdays:
      Summer time: Dieninis 08:00–24:00, Naktinis 00:00–08:00
@@ -336,9 +398,134 @@ function tarifasFromVilniusTime(isoString) {
 }
 
 /* -----------------------------
-   Excel builder (chargingPeriods only)
-   - Detail rows: id, energy_kwh, startedAt, stoppedAt, tarifas
-   - Add Month Summary table below
+   Period extraction (DETAIL ROWS)
+
+   Prefer chargingPeriods if available.
+   Otherwise, fall back to clockAlignedEnergyConsumption (especially for long-running actives),
+   and SLICE to [startedAfter, startedBefore) so a 5-month session shows rows for this month only.
+-------------------------------- */
+
+function parseDateSafe(iso) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  return Number.isFinite(d.getTime()) ? d : null;
+}
+
+function inRange(d, start, end) {
+  if (!d || !start || !end) return false;
+  const t = d.getTime();
+  return t >= start.getTime() && t < end.getTime();
+}
+
+function getClockStartEnd(obj) {
+  const start = obj?.start || obj?.startedAt || obj?.from || obj?.periodStart || null;
+  const end = obj?.end || obj?.stoppedAt || obj?.to || obj?.periodEnd || null;
+  return { start, end };
+}
+
+function getClockEnergyWh(obj) {
+  // common shapes
+  const a =
+    safeNum(obj?.energyConsumed) ??
+    safeNum(obj?.energyConsumption?.total) ??
+    safeNum(obj?.energy) ??
+    safeNum(obj?.consumedEnergy) ??
+    null;
+  return a;
+}
+
+function extractDetailRowsForStation({ sessions, startedAfter, startedBefore }) {
+  const startD = parseDateSafe(startedAfter);
+  const endD = parseDateSafe(startedBefore);
+
+  const rows = [];
+  let sumDay = 0;
+  let sumNight = 0;
+  let rowsCount = 0;
+
+  for (const sess of sessions || []) {
+    const sessionId = String(sess.sessionId || "");
+
+    // 1) chargingPeriods (preferred)
+    const periods = Array.isArray(sess.chargingPeriods) ? sess.chargingPeriods : [];
+    if (periods.length > 0) {
+      for (const p of periods) {
+        const started = p?.startedAt || p?.start || null;
+        const stopped = p?.stoppedAt || p?.end || null;
+
+        // If period has a start time, keep only those starting inside the requested month range
+        // (matches how client wants month report)
+        const dStart = parseDateSafe(started);
+        if (startD && endD && dStart && !inRange(dStart, startD, endD)) continue;
+
+        const energyWh = safeNum(p?.energy) ?? safeNum(p?.energyConsumed) ?? null;
+        const energyKwh = energyWh === null ? null : energyWh / 1000;
+
+        const tarifas = tarifasFromVilniusTime(started);
+
+        if (energyKwh !== null) {
+          if (tarifas === "Dieninis") sumDay += energyKwh;
+          else if (tarifas === "Naktinis") sumNight += energyKwh;
+        }
+
+        rowsCount++;
+
+        rows.push({
+          id: p?.id ?? "",
+          energy_kwh: energyKwh === null ? "" : +energyKwh.toFixed(6),
+          startedAt: toVilniusIsoWithOffset(started),
+          stoppedAt: toVilniusIsoWithOffset(stopped),
+          tarifas,
+        });
+      }
+      continue;
+    }
+
+    // 2) fallback: clockAlignedEnergyConsumption (slice to month range)
+    const clock = Array.isArray(sess.clockAlignedEnergyConsumption)
+      ? sess.clockAlignedEnergyConsumption
+      : [];
+
+    if (clock.length > 0) {
+      let idx = 0;
+      for (const c of clock) {
+        const { start, end } = getClockStartEnd(c);
+        const dStart = parseDateSafe(start);
+        if (startD && endD && dStart && !inRange(dStart, startD, endD)) continue;
+
+        const eWh = getClockEnergyWh(c);
+        // keep zeros too if you want, but it bloats; here we keep even 0 (still valid)
+        const eKwh = eWh === null ? null : eWh / 1000;
+
+        const tarifas = tarifasFromVilniusTime(start);
+
+        if (eKwh !== null) {
+          if (tarifas === "Dieninis") sumDay += eKwh;
+          else if (tarifas === "Naktinis") sumNight += eKwh;
+        }
+
+        rowsCount++;
+        idx++;
+
+        rows.push({
+          // clockAligned doesn’t have an id -> create stable id
+          id: sessionId ? `${sessionId}_${idx}` : `row_${idx}`,
+          energy_kwh: eKwh === null ? "" : +eKwh.toFixed(6),
+          startedAt: toVilniusIsoWithOffset(start),
+          stoppedAt: toVilniusIsoWithOffset(end),
+          tarifas,
+        });
+      }
+    }
+  }
+
+  return { rows, sumDay, sumNight, rowsCount };
+}
+
+/* -----------------------------
+   Excel builder
+   - Details in columns A:E
+   - Summary in columns G:K (to the right)
 -------------------------------- */
 
 function monthKeyFromVilniusIso(isoString) {
@@ -348,65 +535,9 @@ function monthKeyFromVilniusIso(isoString) {
   return `${p.year}-${p.month}`; // YYYY-MM
 }
 
-function makeStationSheetWithSummary({ stationName, sessions }) {
-  // Detail table
-  const detailRows = [];
-  let sumDay = 0;
-  let sumNight = 0;
-  let rowsCount = 0;
-  let monthKey = "";
-
-  for (const sess of sessions || []) {
-    const periods = Array.isArray(sess.chargingPeriods) ? sess.chargingPeriods : [];
-    for (const p of periods) {
-      const energyWh = Number(p?.energy ?? 0);
-      const energyKwh = Number.isFinite(energyWh) ? energyWh / 1000 : 0;
-
-      const started = p?.startedAt || "";
-      const tarifas = tarifasFromVilniusTime(started);
-
-      if (!monthKey && started) monthKey = monthKeyFromVilniusIso(started);
-
-      if (tarifas === "Dieninis") sumDay += energyKwh;
-      else if (tarifas === "Naktinis") sumNight += energyKwh;
-
-      rowsCount++;
-
-      detailRows.push({
-        id: p?.id ?? "",
-        energy_kwh: Number.isFinite(energyKwh) ? +energyKwh.toFixed(6) : "",
-        startedAt: toVilniusIsoWithOffset(p?.startedAt),
-        stoppedAt: toVilniusIsoWithOffset(p?.stoppedAt),
-        tarifas,
-      });
-    }
-  }
-
-  if (detailRows.length === 0) {
-    detailRows.push({
-      id: "",
-      energy_kwh: "",
-      startedAt: "",
-      stoppedAt: "",
-      tarifas: "NO SESSIONS",
-    });
-  }
-
-  // Summary table rows
-  // (If no rows, keep sums at 0 and month from query later; we'll inject month at workbook creation)
-  const summaryRows = [
-    {
-      Month: monthKey || "", // filled later if empty
-      Dieninis_kWh: +sumDay.toFixed(6),
-      Naktinis_kWh: +sumNight.toFixed(6),
-      Total_kWh: +(sumDay + sumNight).toFixed(6),
-      Rows: rowsCount,
-    },
-  ];
-
-  // Build combined sheet with a blank gap and header text rows
-  // We'll create an AOAsheet to control placement
+function makeStationWorksheet({ stationName, detailRows, summary }) {
   const detailHeader = ["id", "energy_kwh", "startedAt", "stoppedAt", "tarifas"];
+
   const detailData = detailRows.map((r) => [
     r.id,
     r.energy_kwh,
@@ -415,76 +546,75 @@ function makeStationSheetWithSummary({ stationName, sessions }) {
     r.tarifas,
   ]);
 
-  const summaryTitle = [`MONTH SUMMARY (${stationName})`];
-  const summaryHeader = ["Month", "Dieninis_kWh", "Naktinis_kWh", "Total_kWh", "Rows"];
-  const summaryData = summaryRows.map((r) => [
-    r.Month,
-    r.Dieninis_kWh,
-    r.Naktinis_kWh,
-    r.Total_kWh,
-    r.Rows,
-  ]);
+  const ws = XLSX.utils.aoa_to_sheet([detailHeader, ...detailData]);
 
-  const aoa = [
-    detailHeader,
-    ...detailData,
-    [],
-    summaryTitle,
-    summaryHeader,
-    ...summaryData,
+  // Summary to the RIGHT (start at G1)
+  const summaryAoa = [
+    [`MONTH SUMMARY (${stationName})`],
+    ["Month", "Dieninis_kWh", "Naktinis_kWh", "Total_kWh", "Rows"],
+    [
+      summary.month,
+      +summary.dieninis.toFixed(6),
+      +summary.naktinis.toFixed(6),
+      +(summary.dieninis + summary.naktinis).toFixed(6),
+      summary.rows,
+    ],
   ];
 
-  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  XLSX.utils.sheet_add_aoa(ws, summaryAoa, { origin: "G1" });
 
-  // Make columns wider a bit
+  // Column widths (A..E) + (G..K)
   ws["!cols"] = [
-    { wch: 12 }, // id
-    { wch: 14 }, // energy_kwh
-    { wch: 26 }, // startedAt
-    { wch: 26 }, // stoppedAt
-    { wch: 12 }, // tarifas
+    { wch: 16 }, // A id
+    { wch: 14 }, // B energy_kwh
+    { wch: 26 }, // C startedAt
+    { wch: 26 }, // D stoppedAt
+    { wch: 12 }, // E tarifas
+    { wch: 3 },  // F gap
+    { wch: 28 }, // G summary title / Month
+    { wch: 14 }, // H
+    { wch: 14 }, // I
+    { wch: 14 }, // J
+    { wch: 10 }, // K
   ];
 
-  return { ws, detailRows, summaryRows };
+  return ws;
 }
 
-function makeExcelPeriodsOnlyWithSummary({ stationNormalized, startedAfter }) {
+function makeExcel({ stationResults, startedAfter, startedBefore }) {
   const wb = XLSX.utils.book_new();
+  const month = monthKeyFromVilniusIso(startedAfter);
 
-  // derive month from startedAfter (Vilnius month)
-  const startedAfterMonth = monthKeyFromVilniusIso(startedAfter);
-
-  for (const st of stationNormalized) {
-    const { ws, summaryRows } = makeStationSheetWithSummary({
-      stationName: st.stationName,
+  for (const st of stationResults) {
+    const { rows, sumDay, sumNight, rowsCount } = extractDetailRowsForStation({
       sessions: st.sessions,
+      startedAfter,
+      startedBefore,
     });
 
-    // If summary month is blank (happens when NO SESSIONS), fill it from query month
-    const sumMonthCellRowIndex = 1; // summaryRows[0]
-    // Find where summary table begins:
-    // It's after: 1 header + detailRows.length data + 1 blank + 1 title + 1 header
-    const detailLen = (st.sessions || []).reduce((acc, s) => {
-      const periods = Array.isArray(s.chargingPeriods) ? s.chargingPeriods : [];
-      return acc + periods.length;
-    }, 0);
-    const detailRowsLen = detailLen > 0 ? detailLen : 1; // we insert 1 row if no sessions
-    const summaryStartRow = 1 + detailRowsLen + 1 + 1 + 1; // 0-index in AOA -> +1 for Excel rows
-    // In AOA layout:
-    // row 1: detail header
-    // rows 2..: detail data
-    // blank row
-    // summary title
-    // summary header
-    // summary data row (this row)
-    // So the summary data row is: (1 header) + (detailRowsLen) + 1 blank + 1 title + 1 header + 1 data
-    const summaryDataRowExcel = 1 + 1 + detailRowsLen + 1 + 1 + 1; // Excel 1-indexed
-    // Month column is A
-    const monthCellAddress = `A${summaryDataRowExcel}`;
+    const detailRows =
+      rows.length > 0
+        ? rows
+        : [
+            {
+              id: "",
+              energy_kwh: "",
+              startedAt: "",
+              stoppedAt: "",
+              tarifas: "NO SESSIONS",
+            },
+          ];
 
-    if (!ws[monthCellAddress] || !ws[monthCellAddress].v) {
-      ws[monthCellAddress] = { t: "s", v: startedAfterMonth || "" };
-    }
+    const ws = makeStationWorksheet({
+      stationName: st.stationName,
+      detailRows,
+      summary: {
+        month,
+        dieninis: sumDay,
+        naktinis: sumNight,
+        rows: rowsCount,
+      },
+    });
 
     const sheetName = String(st.stationName).slice(0, 31);
     XLSX.utils.book_append_sheet(wb, ws, sheetName);
@@ -495,6 +625,7 @@ function makeExcelPeriodsOnlyWithSummary({ stationNormalized, startedAfter }) {
 
 module.exports = async (req, res) => {
   try {
+    // Optional internal protection
     const internalKey = process.env.INTERNAL_API_KEY;
     if (internalKey) {
       const got =
@@ -519,14 +650,14 @@ module.exports = async (req, res) => {
 
     const clockAlignedInterval = Number(req.query.clockAlignedInterval || 15);
     const format = String(req.query.format || "json").toLowerCase();
-
     const perPage = Math.min(100, Math.max(1, Number(req.query.per_page || 100)));
 
     const stationResults = [];
     let totalSessions = 0;
 
     for (const station of stations) {
-      let sessions = await listAllSessionsForStation({
+      // 1) normal month range sessions (started in range)
+      let inRangeSessions = await listAllSessionsForStationInRange({
         baseUrl,
         token,
         chargePointId: station.chargePointId,
@@ -536,16 +667,37 @@ module.exports = async (req, res) => {
         perPage,
       });
 
-      sessions = await enrichActiveSessionsConsumptionStats({
+      // 2) ALSO fetch active sessions (might have started months ago)
+      let activeSessions = await listActiveSessionsForStationBestEffort({
         baseUrl,
         token,
-        sessions,
+        chargePointId: station.chargePointId,
+        clockAlignedInterval,
+        perPage,
+      });
+
+      // Merge by session id (avoid duplicates)
+      const byId = new Map();
+      for (const s of [...(inRangeSessions || []), ...(activeSessions || [])]) {
+        if (!s) continue;
+        const id = String(s.id ?? "");
+        if (!id) continue;
+        if (!byId.has(id)) byId.set(id, s);
+      }
+
+      let mergedSessions = Array.from(byId.values());
+
+      // Enrich actives with consumption stats clockAligned (best-effort)
+      mergedSessions = await enrichActiveSessionsConsumptionStats({
+        baseUrl,
+        token,
+        sessions: mergedSessions,
         clockAlignedInterval,
       });
 
       const normalized = normalizeSessionsForN8n({
         station,
-        sessions,
+        sessions: mergedSessions,
         clockAlignedInterval,
       });
 
@@ -573,10 +725,7 @@ module.exports = async (req, res) => {
     };
 
     if (format === "xlsx") {
-      const buf = makeExcelPeriodsOnlyWithSummary({
-        stationNormalized: stationResults,
-        startedAfter,
-      });
+      const buf = makeExcel({ stationResults, startedAfter, startedBefore });
 
       res.setHeader(
         "Content-Type",
