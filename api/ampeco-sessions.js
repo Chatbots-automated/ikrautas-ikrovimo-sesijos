@@ -1,9 +1,21 @@
 // api/ampeco-sessions.js
 // Vercel Serverless Function (Node runtime)
+//
 // - JSON for n8n by default
-// - ?format=xlsx returns an Excel file with 3 tabs (one per station)
-// Excel tabs contain ONLY: id, energy_kwh, startedAt, stoppedAt, tarifas
-// If a station has no sessions/periods in the month -> still outputs 1 row with tarifas="NO SESSIONS"
+// - ?format=xlsx returns an Excel file with tabs (one per station)
+//
+// Each station sheet has:
+// 1) DETAIL TABLE (columns): id, energy_kwh, startedAt, stoppedAt, tarifas
+//    - If no sessions/periods -> still outputs 1 row with tarifas="NO SESSIONS"
+// 2) MONTH SUMMARY TABLE (same sheet, below details):
+//    - Month (YYYY-MM), Dieninis_kWh, Naktinis_kWh, Total_kWh, Rows
+//
+// Also adds charge point 171: "Aliaksandr Ciurlionio 84A"
+//
+// ENV VARS:
+// - AMPECO_BEARER_TOKEN (required)
+// - AMPECO_BASE_URL (optional, default https://cp.ikrautas.lt)
+// - INTERNAL_API_KEY (optional; if set, must send header x-api-key or query apiKey)
 
 const XLSX = require("xlsx");
 
@@ -11,6 +23,7 @@ const stations = [
   { chargePointId: 326, stationName: "Vadim Čiurlionio 84A" },
   { chargePointId: 218, stationName: "Ignė Čiurlionio g. 84A" },
   { chargePointId: 27, stationName: "Arnas Čiurlionio 84A" },
+  { chargePointId: 171, stationName: "Aliaksandr Ciurlionio 84A" },
 ];
 
 function requireEnv(name) {
@@ -20,9 +33,6 @@ function requireEnv(name) {
 }
 
 function toIsoLocalMonthRangeEuropeVilnius(now = new Date()) {
-  // Default range: current month in Europe/Vilnius
-  // startedAfter = first day 00:00:00
-  // startedBefore = first day of next month 00:00:00
   const tz = "Europe/Vilnius";
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: tz,
@@ -63,7 +73,6 @@ function buildSessionsUrl({
 }) {
   const url = new URL("/public-api/resources/sessions/v1.0", baseUrl);
 
-  // Expansions/flags
   url.searchParams.set("withClockAlignedEnergyConsumption", "true");
   url.searchParams.set("clockAlignedInterval", String(clockAlignedInterval));
   url.searchParams.set("withAuthorization", "true");
@@ -71,19 +80,16 @@ function buildSessionsUrl({
   url.searchParams.set("withChargingPeriods", "true");
   url.searchParams.set("withChargingPeriodsPriceBreakdown", "true");
 
-  // Filters
   url.searchParams.set("filter[chargePointId]", String(chargePointId));
   url.searchParams.set("filter[startedAfter]", startedAfter);
   url.searchParams.set("filter[startedBefore]", startedBefore);
 
-  // Pagination
   url.searchParams.set("per_page", String(perPage));
   url.searchParams.set("cursor", cursor === null ? "null" : String(cursor));
 
   return url.toString();
 }
 
-// Best-effort enrichment endpoint (if it 404s, we ignore it)
 function buildConsumptionStatsUrl({ baseUrl, sessionId, clockAlignedInterval }) {
   const url = new URL(
     `/public-api/resources/sessions/v1.0/${encodeURIComponent(
@@ -225,16 +231,9 @@ function normalizeSessionsForN8n({ station, sessions, clockAlignedInterval }) {
 
       sessionId: String(s?.id ?? ""),
       status: s?.status ?? null,
-      reason: s?.reason ?? null,
 
       startedAt: s?.startedAt ?? null,
       stoppedAt: s?.stoppedAt ?? null,
-      lastUpdatedAt: s?.lastUpdatedAt ?? null,
-
-      // Keep these for JSON/debug/optional usage
-      energyWh: safeNum(s?.energy),
-      energyConsumptionTotalWh: safeNum(s?.energyConsumption?.total),
-      energyConsumptionGridWh: safeNum(s?.energyConsumption?.grid),
 
       chargingPeriods: Array.isArray(s?.chargingPeriods) ? s.chargingPeriods : [],
       clockAlignedIntervalMinutes: clockAlignedInterval,
@@ -244,8 +243,8 @@ function normalizeSessionsForN8n({ station, sessions, clockAlignedInterval }) {
 }
 
 /* -----------------------------
-   TARIFAS logic (from your image)
-   - Weekend (Sat/Sun) always Naktinis
+   TARIFAS logic (from provided image)
+   - Weekend (Sat/Sun): Naktinis all day
    - Weekdays:
      Summer time: Dieninis 08:00–24:00, Naktinis 00:00–08:00
      Winter time: Dieninis 07:00–23:00, Naktinis 23:00–07:00
@@ -294,9 +293,13 @@ function toVilniusIsoWithOffset(isoString) {
   const d = new Date(isoString);
   const p = vilniusParts(d);
   const off = offsetToHHMM(p.tzOffset);
-  return `${p.year}-${p.month}-${p.day}T${String(p.hour).padStart(2, "0")}:${String(
-    p.minute
-  ).padStart(2, "0")}:${String(p.second).padStart(2, "0")}${off}`;
+  return `${p.year}-${p.month}-${p.day}T${String(p.hour).padStart(
+    2,
+    "0"
+  )}:${String(p.minute).padStart(2, "0")}:${String(p.second).padStart(
+    2,
+    "0"
+  )}${off}`;
 }
 
 function weekdayVilnius(date) {
@@ -318,7 +321,7 @@ function tarifasFromVilniusTime(isoString) {
   if (!isoString) return "";
   const d = new Date(isoString);
 
-  const wd = weekdayVilnius(d); // 1..7
+  const wd = weekdayVilnius(d);
   if (wd === 6 || wd === 7) return "Naktinis"; // VI–VII
 
   const p = vilniusParts(d);
@@ -334,42 +337,156 @@ function tarifasFromVilniusTime(isoString) {
 
 /* -----------------------------
    Excel builder (chargingPeriods only)
-   Columns: id, energy_kwh, startedAt, stoppedAt, tarifas
-   If station has no periods -> 1 row with tarifas="NO SESSIONS"
+   - Detail rows: id, energy_kwh, startedAt, stoppedAt, tarifas
+   - Add Month Summary table below
 -------------------------------- */
 
-function makeExcelPeriodsOnly({ stationNormalized }) {
+function monthKeyFromVilniusIso(isoString) {
+  if (!isoString) return "";
+  const d = new Date(isoString);
+  const p = vilniusParts(d);
+  return `${p.year}-${p.month}`; // YYYY-MM
+}
+
+function makeStationSheetWithSummary({ stationName, sessions }) {
+  // Detail table
+  const detailRows = [];
+  let sumDay = 0;
+  let sumNight = 0;
+  let rowsCount = 0;
+  let monthKey = "";
+
+  for (const sess of sessions || []) {
+    const periods = Array.isArray(sess.chargingPeriods) ? sess.chargingPeriods : [];
+    for (const p of periods) {
+      const energyWh = Number(p?.energy ?? 0);
+      const energyKwh = Number.isFinite(energyWh) ? energyWh / 1000 : 0;
+
+      const started = p?.startedAt || "";
+      const tarifas = tarifasFromVilniusTime(started);
+
+      if (!monthKey && started) monthKey = monthKeyFromVilniusIso(started);
+
+      if (tarifas === "Dieninis") sumDay += energyKwh;
+      else if (tarifas === "Naktinis") sumNight += energyKwh;
+
+      rowsCount++;
+
+      detailRows.push({
+        id: p?.id ?? "",
+        energy_kwh: Number.isFinite(energyKwh) ? +energyKwh.toFixed(6) : "",
+        startedAt: toVilniusIsoWithOffset(p?.startedAt),
+        stoppedAt: toVilniusIsoWithOffset(p?.stoppedAt),
+        tarifas,
+      });
+    }
+  }
+
+  if (detailRows.length === 0) {
+    detailRows.push({
+      id: "",
+      energy_kwh: "",
+      startedAt: "",
+      stoppedAt: "",
+      tarifas: "NO SESSIONS",
+    });
+  }
+
+  // Summary table rows
+  // (If no rows, keep sums at 0 and month from query later; we'll inject month at workbook creation)
+  const summaryRows = [
+    {
+      Month: monthKey || "", // filled later if empty
+      Dieninis_kWh: +sumDay.toFixed(6),
+      Naktinis_kWh: +sumNight.toFixed(6),
+      Total_kWh: +(sumDay + sumNight).toFixed(6),
+      Rows: rowsCount,
+    },
+  ];
+
+  // Build combined sheet with a blank gap and header text rows
+  // We'll create an AOAsheet to control placement
+  const detailHeader = ["id", "energy_kwh", "startedAt", "stoppedAt", "tarifas"];
+  const detailData = detailRows.map((r) => [
+    r.id,
+    r.energy_kwh,
+    r.startedAt,
+    r.stoppedAt,
+    r.tarifas,
+  ]);
+
+  const summaryTitle = [`MONTH SUMMARY (${stationName})`];
+  const summaryHeader = ["Month", "Dieninis_kWh", "Naktinis_kWh", "Total_kWh", "Rows"];
+  const summaryData = summaryRows.map((r) => [
+    r.Month,
+    r.Dieninis_kWh,
+    r.Naktinis_kWh,
+    r.Total_kWh,
+    r.Rows,
+  ]);
+
+  const aoa = [
+    detailHeader,
+    ...detailData,
+    [],
+    summaryTitle,
+    summaryHeader,
+    ...summaryData,
+  ];
+
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+
+  // Make columns wider a bit
+  ws["!cols"] = [
+    { wch: 12 }, // id
+    { wch: 14 }, // energy_kwh
+    { wch: 26 }, // startedAt
+    { wch: 26 }, // stoppedAt
+    { wch: 12 }, // tarifas
+  ];
+
+  return { ws, detailRows, summaryRows };
+}
+
+function makeExcelPeriodsOnlyWithSummary({ stationNormalized, startedAfter }) {
   const wb = XLSX.utils.book_new();
 
+  // derive month from startedAfter (Vilnius month)
+  const startedAfterMonth = monthKeyFromVilniusIso(startedAfter);
+
   for (const st of stationNormalized) {
-    const rows = [];
+    const { ws, summaryRows } = makeStationSheetWithSummary({
+      stationName: st.stationName,
+      sessions: st.sessions,
+    });
 
-    for (const sess of st.sessions || []) {
-      const periods = Array.isArray(sess.chargingPeriods) ? sess.chargingPeriods : [];
-      for (const p of periods) {
-        const energyWh = Number(p?.energy ?? 0);
-        rows.push({
-          id: p?.id ?? "",
-          energy_kwh: Number.isFinite(energyWh) ? +(energyWh / 1000).toFixed(6) : "",
-          startedAt: toVilniusIsoWithOffset(p?.startedAt),
-          stoppedAt: toVilniusIsoWithOffset(p?.stoppedAt),
-          tarifas: tarifasFromVilniusTime(p?.startedAt),
-        });
-      }
-    }
+    // If summary month is blank (happens when NO SESSIONS), fill it from query month
+    const sumMonthCellRowIndex = 1; // summaryRows[0]
+    // Find where summary table begins:
+    // It's after: 1 header + detailRows.length data + 1 blank + 1 title + 1 header
+    const detailLen = (st.sessions || []).reduce((acc, s) => {
+      const periods = Array.isArray(s.chargingPeriods) ? s.chargingPeriods : [];
+      return acc + periods.length;
+    }, 0);
+    const detailRowsLen = detailLen > 0 ? detailLen : 1; // we insert 1 row if no sessions
+    const summaryStartRow = 1 + detailRowsLen + 1 + 1 + 1; // 0-index in AOA -> +1 for Excel rows
+    // In AOA layout:
+    // row 1: detail header
+    // rows 2..: detail data
+    // blank row
+    // summary title
+    // summary header
+    // summary data row (this row)
+    // So the summary data row is: (1 header) + (detailRowsLen) + 1 blank + 1 title + 1 header + 1 data
+    const summaryDataRowExcel = 1 + 1 + detailRowsLen + 1 + 1 + 1; // Excel 1-indexed
+    // Month column is A
+    const monthCellAddress = `A${summaryDataRowExcel}`;
 
-    if (rows.length === 0) {
-      rows.push({
-        id: "",
-        energy_kwh: "",
-        startedAt: "",
-        stoppedAt: "",
-        tarifas: "NO SESSIONS",
-      });
+    if (!ws[monthCellAddress] || !ws[monthCellAddress].v) {
+      ws[monthCellAddress] = { t: "s", v: startedAfterMonth || "" };
     }
 
     const sheetName = String(st.stationName).slice(0, 31);
-    const ws = XLSX.utils.json_to_sheet(rows);
     XLSX.utils.book_append_sheet(wb, ws, sheetName);
   }
 
@@ -378,7 +495,6 @@ function makeExcelPeriodsOnly({ stationNormalized }) {
 
 module.exports = async (req, res) => {
   try {
-    // Optional internal protection
     const internalKey = process.env.INTERNAL_API_KEY;
     if (internalKey) {
       const got =
@@ -443,7 +559,6 @@ module.exports = async (req, res) => {
       });
     }
 
-    // JSON payload for n8n (keep it structured + include periods)
     const payload = {
       ok: true,
       generatedAt: new Date().toISOString(),
@@ -458,7 +573,10 @@ module.exports = async (req, res) => {
     };
 
     if (format === "xlsx") {
-      const buf = makeExcelPeriodsOnly({ stationNormalized: stationResults });
+      const buf = makeExcelPeriodsOnlyWithSummary({
+        stationNormalized: stationResults,
+        startedAfter,
+      });
 
       res.setHeader(
         "Content-Type",
