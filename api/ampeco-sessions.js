@@ -75,7 +75,7 @@ function buildSessionsUrl({
   clockAlignedInterval,
   cursor,
   perPage,
-  statusFilter, // optional "active"
+  statusFilter,
 }) {
   const url = new URL("/public-api/resources/sessions/v1.0", baseUrl);
 
@@ -428,7 +428,6 @@ function extractDetailRowsForStation({ sessions, startedAfter, startedBefore }) 
   for (const sess of sessions || []) {
     const sessionId = String(sess.sessionId || "");
 
-    // 1) chargingPeriods (preferred)
     const periods = Array.isArray(sess.chargingPeriods) ? sess.chargingPeriods : [];
     if (periods.length > 0) {
       for (const p of periods) {
@@ -461,7 +460,6 @@ function extractDetailRowsForStation({ sessions, startedAfter, startedBefore }) 
       continue;
     }
 
-    // 2) fallback: clockAlignedEnergyConsumption (slice to range)
     const clock = Array.isArray(sess.clockAlignedEnergyConsumption)
       ? sess.clockAlignedEnergyConsumption
       : [];
@@ -511,6 +509,14 @@ function monthKeyFromVilniusIso(isoString) {
   return `${p.year}-${p.month}`; // YYYY-MM
 }
 
+// IMPORTANT: billing-cycle report month should be based on the period END (startedBefore),
+// not on startedAfter (which might be previous month day 30).
+function reportMonthKey(startedAfter, startedBefore) {
+  const endKey = monthKeyFromVilniusIso(startedBefore);
+  if (endKey) return endKey;
+  return monthKeyFromVilniusIso(startedAfter);
+}
+
 function makeStationWorksheet({ stationName, detailRows, summary }) {
   const detailHeader = ["id", "energy_kwh", "startedAt", "stoppedAt", "tarifas"];
 
@@ -557,7 +563,7 @@ function makeStationWorksheet({ stationName, detailRows, summary }) {
 
 function makeExcel({ stationResults, startedAfter, startedBefore }) {
   const wb = XLSX.utils.book_new();
-  const month = monthKeyFromVilniusIso(startedAfter);
+  const month = reportMonthKey(startedAfter, startedBefore); // <-- FIXED
 
   for (const st of stationResults) {
     const { rows, sumDay, sumNight, rowsCount } = extractDetailRowsForStation({
@@ -598,20 +604,15 @@ function makeExcel({ stationResults, startedAfter, startedBefore }) {
 }
 
 /* -----------------------------
-   Filename + Content-Disposition (FIX for LT chars)
-   - You want: "Čiurlionio 84A_YYYY-MM.xlsx"
-   - But raw LT chars break Node header validation
-   - So we send:
-       filename="Ciurlionio_84A_YYYY-MM.xlsx"  (ASCII fallback)
-       filename*=UTF-8''%C4%8Ciurlionio%2084A_YYYY-MM.xlsx (UTF-8 real name)
+   Filename + Content-Disposition (LT chars safe)
 -------------------------------- */
 
 function decideBaseFilenameFromBaseUrl(_baseUrl) {
   return "Čiurlionio 84A";
 }
 
-function makeFilename(baseUrl, startedAfter) {
-  const month = monthKeyFromVilniusIso(startedAfter); // YYYY-MM
+function makeFilename(baseUrl, startedAfter, startedBefore) {
+  const month = reportMonthKey(startedAfter, startedBefore); // <-- FIXED
   const base = decideBaseFilenameFromBaseUrl(baseUrl);
   return `${base}_${month}.xlsx`;
 }
@@ -619,8 +620,8 @@ function makeFilename(baseUrl, startedAfter) {
 function sanitizeAsciiFilename(name) {
   return String(name)
     .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")     // strip diacritics
-    .replace(/[^A-Za-z0-9._-]+/g, "_")   // safe only
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^A-Za-z0-9._-]+/g, "_")
     .replace(/_+/g, "_")
     .replace(/^_+|_+$/g, "");
 }
@@ -730,7 +731,7 @@ module.exports = async (req, res) => {
     if (format === "xlsx") {
       const buf = makeExcel({ stationResults, startedAfter, startedBefore });
 
-      const filename = makeFilename(baseUrl, startedAfter);
+      const filename = makeFilename(baseUrl, startedAfter, startedBefore); // <-- FIXED
 
       res.setHeader(
         "Content-Type",
