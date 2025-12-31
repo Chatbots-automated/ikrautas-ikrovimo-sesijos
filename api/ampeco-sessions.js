@@ -224,7 +224,6 @@ async function listActiveSessionsForStationBestEffort({
     });
     return Array.isArray(active) ? active : [];
   } catch (e) {
-    // Don't break the whole export if tenant doesn't support status filter
     return [];
   }
 }
@@ -305,12 +304,7 @@ function normalizeSessionsForN8n({ station, sessions, clockAlignedInterval }) {
 }
 
 /* -----------------------------
-   TARIFAS logic (from your image)
-   - Weekend (Sat/Sun): Naktinis all day
-   - Weekdays:
-     Summer time: Dieninis 08:00–24:00, Naktinis 00:00–08:00
-     Winter time: Dieninis 07:00–23:00, Naktinis 23:00–07:00
-   Detected by Vilnius timezone offset (+03 summer, +02 winter)
+   TARIFAS logic
 -------------------------------- */
 
 const VILNIUS_TZ = "Europe/Vilnius";
@@ -325,7 +319,7 @@ function vilniusParts(date) {
     minute: "2-digit",
     second: "2-digit",
     hour12: false,
-    timeZoneName: "shortOffset", // "GMT+2"/"GMT+3"
+    timeZoneName: "shortOffset",
   }).formatToParts(date);
 
   const get = (t) => parts.find((p) => p.type === t)?.value;
@@ -384,7 +378,7 @@ function tarifasFromVilniusTime(isoString) {
   const d = new Date(isoString);
 
   const wd = weekdayVilnius(d);
-  if (wd === 6 || wd === 7) return "Naktinis"; // VI–VII
+  if (wd === 6 || wd === 7) return "Naktinis";
 
   const p = vilniusParts(d);
   const t = p.hour * 60 + p.minute;
@@ -399,10 +393,6 @@ function tarifasFromVilniusTime(isoString) {
 
 /* -----------------------------
    Period extraction (DETAIL ROWS)
-
-   Prefer chargingPeriods if available.
-   Otherwise, fall back to clockAlignedEnergyConsumption (especially for long-running actives),
-   and SLICE to [startedAfter, startedBefore) so a 5-month session shows rows for this month only.
 -------------------------------- */
 
 function parseDateSafe(iso) {
@@ -418,20 +408,20 @@ function inRange(d, start, end) {
 }
 
 function getClockStartEnd(obj) {
-  const start = obj?.start || obj?.startedAt || obj?.from || obj?.periodStart || null;
+  const start =
+    obj?.start || obj?.startedAt || obj?.from || obj?.periodStart || null;
   const end = obj?.end || obj?.stoppedAt || obj?.to || obj?.periodEnd || null;
   return { start, end };
 }
 
 function getClockEnergyWh(obj) {
-  // common shapes
-  const a =
+  return (
     safeNum(obj?.energyConsumed) ??
     safeNum(obj?.energyConsumption?.total) ??
     safeNum(obj?.energy) ??
     safeNum(obj?.consumedEnergy) ??
-    null;
-  return a;
+    null
+  );
 }
 
 function extractDetailRowsForStation({ sessions, startedAfter, startedBefore }) {
@@ -453,8 +443,6 @@ function extractDetailRowsForStation({ sessions, startedAfter, startedBefore }) 
         const started = p?.startedAt || p?.start || null;
         const stopped = p?.stoppedAt || p?.end || null;
 
-        // If period has a start time, keep only those starting inside the requested month range
-        // (matches how client wants month report)
         const dStart = parseDateSafe(started);
         if (startD && endD && dStart && !inRange(dStart, startD, endD)) continue;
 
@@ -494,7 +482,6 @@ function extractDetailRowsForStation({ sessions, startedAfter, startedBefore }) 
         if (startD && endD && dStart && !inRange(dStart, startD, endD)) continue;
 
         const eWh = getClockEnergyWh(c);
-        // keep zeros too if you want, but it bloats; here we keep even 0 (still valid)
         const eKwh = eWh === null ? null : eWh / 1000;
 
         const tarifas = tarifasFromVilniusTime(start);
@@ -508,7 +495,6 @@ function extractDetailRowsForStation({ sessions, startedAfter, startedBefore }) 
         idx++;
 
         rows.push({
-          // clockAligned doesn’t have an id -> create stable id
           id: sessionId ? `${sessionId}_${idx}` : `row_${idx}`,
           energy_kwh: eKwh === null ? "" : +eKwh.toFixed(6),
           startedAt: toVilniusIsoWithOffset(start),
@@ -524,8 +510,6 @@ function extractDetailRowsForStation({ sessions, startedAfter, startedBefore }) 
 
 /* -----------------------------
    Excel builder
-   - Details in columns A:E
-   - Summary in columns G:K (to the right)
 -------------------------------- */
 
 function monthKeyFromVilniusIso(isoString) {
@@ -548,7 +532,6 @@ function makeStationWorksheet({ stationName, detailRows, summary }) {
 
   const ws = XLSX.utils.aoa_to_sheet([detailHeader, ...detailData]);
 
-  // Summary to the RIGHT (start at G1)
   const summaryAoa = [
     [`MONTH SUMMARY (${stationName})`],
     ["Month", "Dieninis_kWh", "Naktinis_kWh", "Total_kWh", "Rows"],
@@ -563,19 +546,18 @@ function makeStationWorksheet({ stationName, detailRows, summary }) {
 
   XLSX.utils.sheet_add_aoa(ws, summaryAoa, { origin: "G1" });
 
-  // Column widths (A..E) + (G..K)
   ws["!cols"] = [
-    { wch: 16 }, // A id
-    { wch: 14 }, // B energy_kwh
-    { wch: 26 }, // C startedAt
-    { wch: 26 }, // D stoppedAt
-    { wch: 12 }, // E tarifas
-    { wch: 3 },  // F gap
-    { wch: 28 }, // G summary title / Month
-    { wch: 14 }, // H
-    { wch: 14 }, // I
-    { wch: 14 }, // J
-    { wch: 10 }, // K
+    { wch: 16 },
+    { wch: 14 },
+    { wch: 26 },
+    { wch: 26 },
+    { wch: 12 },
+    { wch: 3 },
+    { wch: 28 },
+    { wch: 14 },
+    { wch: 14 },
+    { wch: 14 },
+    { wch: 10 },
   ];
 
   return ws;
@@ -623,9 +605,25 @@ function makeExcel({ stationResults, startedAfter, startedBefore }) {
   return XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
 }
 
+/* -----------------------------
+   Filename: "Čiurlionio 84A_metai_mėnuo.xlsx"
+   - Extract base name from AMPECO baseUrl host (cp.ikrautas.lt -> "Čiurlionio 84A")
+   - Month from startedAfter in Vilnius TZ
+-------------------------------- */
+
+function decideBaseFilenameFromBaseUrl(baseUrl) {
+  // If you want it ALWAYS exactly "Čiurlionio 84A" regardless of tenant, hardcode here.
+  return "Čiurlionio 84A";
+}
+
+function makeFilename(baseUrl, startedAfter) {
+  const month = monthKeyFromVilniusIso(startedAfter); // YYYY-MM
+  const base = decideBaseFilenameFromBaseUrl(baseUrl);
+  return `${base}_${month}.xlsx`;
+}
+
 module.exports = async (req, res) => {
   try {
-    // Optional internal protection
     const internalKey = process.env.INTERNAL_API_KEY;
     if (internalKey) {
       const got =
@@ -656,7 +654,6 @@ module.exports = async (req, res) => {
     let totalSessions = 0;
 
     for (const station of stations) {
-      // 1) normal month range sessions (started in range)
       let inRangeSessions = await listAllSessionsForStationInRange({
         baseUrl,
         token,
@@ -667,7 +664,6 @@ module.exports = async (req, res) => {
         perPage,
       });
 
-      // 2) ALSO fetch active sessions (might have started months ago)
       let activeSessions = await listActiveSessionsForStationBestEffort({
         baseUrl,
         token,
@@ -676,7 +672,6 @@ module.exports = async (req, res) => {
         perPage,
       });
 
-      // Merge by session id (avoid duplicates)
       const byId = new Map();
       for (const s of [...(inRangeSessions || []), ...(activeSessions || [])]) {
         if (!s) continue;
@@ -687,7 +682,6 @@ module.exports = async (req, res) => {
 
       let mergedSessions = Array.from(byId.values());
 
-      // Enrich actives with consumption stats clockAligned (best-effort)
       mergedSessions = await enrichActiveSessionsConsumptionStats({
         baseUrl,
         token,
@@ -727,17 +721,13 @@ module.exports = async (req, res) => {
     if (format === "xlsx") {
       const buf = makeExcel({ stationResults, startedAfter, startedBefore });
 
+      const filename = makeFilename(baseUrl, startedAfter);
+
       res.setHeader(
         "Content-Type",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
       );
-      res.setHeader(
-        "Content-Disposition",
-        `attachment; filename="ampeco_periods_${startedAfter.replace(
-          /[:+]/g,
-          "-"
-        )}_${startedBefore.replace(/[:+]/g, "-")}.xlsx"`
-      );
+      res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
       return res.status(200).send(buf);
     }
 
