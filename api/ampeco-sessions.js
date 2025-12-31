@@ -11,10 +11,9 @@
 //    - Month (YYYY-MM), Dieninis_kWh, Naktinis_kWh, Total_kWh, Rows
 //
 // IMPORTANT FIX for long-running ACTIVE sessions:
-// - Your previous code only fetched sessions where startedAt is inside the month.
-// - If a session started 5 months ago and is still active, it won’t be returned by filter[startedAfter].
-// - So now we ALSO fetch ACTIVE sessions without date filters (best-effort) and then slice their
-//   clock-aligned consumption to the requested month range.
+// - Fetch sessions started in range
+// - ALSO fetch ACTIVE sessions without date filters (best-effort)
+// - Then slice clock-aligned consumption to the requested range
 //
 // Stations include charge point 171: "Aliaksandr Ciurlionio 84A"
 //
@@ -89,11 +88,9 @@ function buildSessionsUrl({
 
   url.searchParams.set("filter[chargePointId]", String(chargePointId));
 
-  // Only set date filters when provided
   if (startedAfter) url.searchParams.set("filter[startedAfter]", String(startedAfter));
   if (startedBefore) url.searchParams.set("filter[startedBefore]", String(startedBefore));
 
-  // Best-effort: many AMPECO tenants support this
   if (statusFilter) url.searchParams.set("filter[status]", String(statusFilter));
 
   url.searchParams.set("per_page", String(perPage));
@@ -102,12 +99,9 @@ function buildSessionsUrl({
   return url.toString();
 }
 
-// Best-effort enrichment endpoint (if it 404s, we ignore it)
 function buildConsumptionStatsUrl({ baseUrl, sessionId, clockAlignedInterval }) {
   const url = new URL(
-    `/public-api/resources/sessions/v1.0/${encodeURIComponent(
-      String(sessionId)
-    )}/consumption-stats`,
+    `/public-api/resources/sessions/v1.0/${encodeURIComponent(String(sessionId))}/consumption-stats`,
     baseUrl
   );
   url.searchParams.set("clockAlignedInterval", String(clockAlignedInterval));
@@ -209,8 +203,6 @@ async function listActiveSessionsForStationBestEffort({
   clockAlignedInterval,
   perPage = 100,
 }) {
-  // Some tenants support filter[status]=active.
-  // If not supported, we just return [] and proceed (no hard fail).
   try {
     const active = await listPagedSessions({
       baseUrl,
@@ -223,7 +215,7 @@ async function listActiveSessionsForStationBestEffort({
       statusFilter: "active",
     });
     return Array.isArray(active) ? active : [];
-  } catch (e) {
+  } catch {
     return [];
   }
 }
@@ -469,7 +461,7 @@ function extractDetailRowsForStation({ sessions, startedAfter, startedBefore }) 
       continue;
     }
 
-    // 2) fallback: clockAlignedEnergyConsumption (slice to month range)
+    // 2) fallback: clockAlignedEnergyConsumption (slice to range)
     const clock = Array.isArray(sess.clockAlignedEnergyConsumption)
       ? sess.clockAlignedEnergyConsumption
       : [];
@@ -606,13 +598,15 @@ function makeExcel({ stationResults, startedAfter, startedBefore }) {
 }
 
 /* -----------------------------
-   Filename: "Čiurlionio 84A_metai_mėnuo.xlsx"
-   - Extract base name from AMPECO baseUrl host (cp.ikrautas.lt -> "Čiurlionio 84A")
-   - Month from startedAfter in Vilnius TZ
+   Filename + Content-Disposition (FIX for LT chars)
+   - You want: "Čiurlionio 84A_YYYY-MM.xlsx"
+   - But raw LT chars break Node header validation
+   - So we send:
+       filename="Ciurlionio_84A_YYYY-MM.xlsx"  (ASCII fallback)
+       filename*=UTF-8''%C4%8Ciurlionio%2084A_YYYY-MM.xlsx (UTF-8 real name)
 -------------------------------- */
 
-function decideBaseFilenameFromBaseUrl(baseUrl) {
-  // If you want it ALWAYS exactly "Čiurlionio 84A" regardless of tenant, hardcode here.
+function decideBaseFilenameFromBaseUrl(_baseUrl) {
   return "Čiurlionio 84A";
 }
 
@@ -620,6 +614,21 @@ function makeFilename(baseUrl, startedAfter) {
   const month = monthKeyFromVilniusIso(startedAfter); // YYYY-MM
   const base = decideBaseFilenameFromBaseUrl(baseUrl);
   return `${base}_${month}.xlsx`;
+}
+
+function sanitizeAsciiFilename(name) {
+  return String(name)
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")     // strip diacritics
+    .replace(/[^A-Za-z0-9._-]+/g, "_")   // safe only
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function contentDispositionUtf8(filename) {
+  const ascii = sanitizeAsciiFilename(filename) || "report.xlsx";
+  const utf8 = encodeURIComponent(filename);
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${utf8}`;
 }
 
 module.exports = async (req, res) => {
@@ -727,7 +736,7 @@ module.exports = async (req, res) => {
         "Content-Type",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
       );
-      res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+      res.setHeader("Content-Disposition", contentDispositionUtf8(filename));
       return res.status(200).send(buf);
     }
 
