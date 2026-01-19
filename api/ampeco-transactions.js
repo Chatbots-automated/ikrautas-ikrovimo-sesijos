@@ -3,19 +3,19 @@
 //
 // GET /api/ampeco-transactions?createdAfter=...&createdBefore=...&per_page=100&max_pages=200&max_items=20000
 //
-// What it does (matches your n8n flow, but returns UNIQUE clients with email):
+// Matches your n8n flow BUT does it efficiently:
+//
 // 1) Fetch ALL transactions for date range (cursor pagination)
-// 2) Filter:
+// 2) Filter transactions:
 //    - totalAmount != 0
 //    - status === "finalized"
-//    - paymentMethod matches: "<any letters> **** <4 digits>" (e.g. "mastercard **** 4263")
-// 3) Deduplicate by userId (so 10 tx for same user -> 1 result)
-// 4) For each unique userId, GET /users/{userId}/invoice-details
-// 5) Keep only users where invoice-details.requireInvoice === false
-// 6) Ensure email is included:
-//    - Try invoice-details fields first
-//    - If missing, fallback to GET /users/{userId} (cached)
-// 7) Response: data = [{ userId, email, invoiceDetails, sampleTransaction, ... }]
+//    - paymentMethod matches: "<any letters> **** <4 digits>"
+// 3) For unique userIds from filtered transactions:
+//    - GET /users/{userId}/invoice-details (cached)
+//    - Keep only users where requireInvoice === false
+//    - Extract email (invoice-details -> fallback to /users/{userId})
+// 4) Return ALL filtered transactions whose userId is allowlisted
+//    + add userEmail per transaction
 //
 // ENV REQUIRED:
 // AMPECO_BASE_URL = https://cp.ikrautas.lt
@@ -45,7 +45,6 @@ module.exports = async (req, res) => {
     // ---------- query params ----------
     const perPage = clampInt(req.query.per_page, 1, 100, 100);
 
-    // Defaults: current month [start, nextMonthStart)
     const now = new Date();
     const defaultCreatedAfter = new Date(
       Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0)
@@ -57,24 +56,21 @@ module.exports = async (req, res) => {
     const createdAfter = toIsoOrDefault(req.query.createdAfter, defaultCreatedAfter);
     const createdBefore = toIsoOrDefault(req.query.createdBefore, defaultCreatedBefore);
 
-    // safety caps
     const maxPages = clampInt(req.query.max_pages, 1, 500, 200);
     const maxItems = clampInt(req.query.max_items, 1, 100000, 20000);
-
-    // concurrency for API calls
     const concurrency = clampInt(req.query.concurrency, 1, 25, 10);
 
-    // payment method regex (your n8n logic)
+    // payment method regex (same intent as your n8n regex)
     const paymentRegexStr =
       typeof req.query.paymentRegex === "string" && req.query.paymentRegex.trim()
         ? req.query.paymentRegex.trim()
-        : String.raw`[A-Za-z].*\*{4}\s*\d{4}\b`;
+        : String.raw`.*\*{4}\s*\d{4}\b`;
 
     let paymentRegex;
     try {
       paymentRegex = new RegExp(paymentRegexStr);
     } catch {
-      paymentRegex = /[A-Za-z].*\*{4}\s*\d{4}\b/;
+      paymentRegex = /.*\*{4}\s*\d{4}\b/;
     }
 
     // ---------- 1) Fetch all transactions (cursor pagination) ----------
@@ -97,56 +93,61 @@ module.exports = async (req, res) => {
       const rows = Array.isArray(json?.data) ? json.data : [];
       all.push(...rows);
 
+      // cursor pagination: usually links.next
       nextUrl =
-        (json?.links && typeof json.links.next === "string" && json.links.next) || null;
+        (json?.links && typeof json.links.next === "string" && json.links.next) ||
+        (json?.links && typeof json.links.next_url === "string" && json.links.next_url) ||
+        (typeof json?.next_url === "string" && json.next_url) ||
+        null;
 
       if (!nextUrl) break;
     }
 
     const transactions = all.slice(0, maxItems);
 
-    // ---------- 2) Filter like your n8n Filter node ----------
-    const filtered = transactions.filter((t) => {
+    // ---------- 2) Filter transactions like your n8n Filter node ----------
+    const reasons = { totalZero: 0, statusNotFinal: 0, payNoMatch: 0, missingUserId: 0 };
+    const filtered = [];
+
+    for (const t of transactions) {
       const totalAmount = Number(t?.totalAmount ?? t?.amount ?? 0);
       const status = String(t?.status ?? "");
       const paymentMethod = String(t?.paymentMethod ?? "");
-
-      if (!Number.isFinite(totalAmount) || totalAmount === 0) return false;
-      if (status !== "finalized") return false;
-      if (!paymentRegex.test(paymentMethod)) return false;
-
-      return true;
-    });
-
-    // ---------- 3) Deduplicate by userId (unique clients only) ----------
-    // Keep the FIRST transaction we see per userId as "sampleTransaction"
-    const byUser = new Map(); // userId -> { userId, sampleTransaction }
-    let missingUserIdCount = 0;
-
-    for (const t of filtered) {
       const userId = t?.userId;
-      if (userId == null) {
-        missingUserIdCount++;
+
+      if (!Number.isFinite(totalAmount) || totalAmount === 0) {
+        reasons.totalZero++;
         continue;
       }
-      const key = String(userId);
-      if (!byUser.has(key)) {
-        byUser.set(key, { userId: key, sampleTransaction: t });
+      if (status !== "finalized") {
+        reasons.statusNotFinal++;
+        continue;
       }
+      if (!paymentRegex.test(paymentMethod)) {
+        reasons.payNoMatch++;
+        continue;
+      }
+      if (userId == null) {
+        reasons.missingUserId++;
+        continue;
+      }
+
+      filtered.push(t);
     }
 
-    const uniqueUsers = Array.from(byUser.values());
+    // ---------- 3) Build unique userId set from filtered transactions ----------
+    const userIds = [...new Set(filtered.map((t) => String(t.userId)))];
 
-    // ---------- 4/5/6) invoice-details + email enrichment (cached) ----------
+    // caches
     const invoiceCache = new Map(); // userId -> invoiceDetails|null
     const userCache = new Map(); // userId -> userProfile|null
-    const invoiceFetchErrors = { count: 0 };
-    const userFetchErrors = { count: 0 };
 
-    const tasks = uniqueUsers.map((u) => async () => {
-      const userId = u.userId;
+    let invoiceFetchErrors = 0;
+    let userFetchErrors = 0;
 
-      // ----- invoice-details -----
+    // fetch invoice-details for each unique userId (concurrently)
+    const userTasks = userIds.map((userId) => async () => {
+      // invoice-details
       let invoiceDetails = invoiceCache.get(userId);
       if (invoiceDetails === undefined) {
         const url = `${baseUrl}/public-api/resources/users/v1.0/${encodeURIComponent(
@@ -155,21 +156,21 @@ module.exports = async (req, res) => {
         try {
           invoiceDetails = await fetchJson(url, token);
           invoiceCache.set(userId, invoiceDetails);
-        } catch (e) {
-          invoiceFetchErrors.count++;
+        } catch {
+          invoiceFetchErrors++;
           invoiceDetails = null;
           invoiceCache.set(userId, null);
         }
       }
 
-      // Filter1: requireInvoice === false
       const requireInvoice = invoiceDetails?.requireInvoice;
+
+      // only allow requireInvoice === false (same as your Filter1)
       if (requireInvoice !== false) {
-        return null; // exclude
+        return { userId, allowed: false, email: null, invoiceDetails };
       }
 
-      // ----- email (best effort) -----
-      // invoice-details email field names can vary, so try multiple
+      // email from invoiceDetails (try several keys)
       let email =
         pickFirstString(
           invoiceDetails?.email,
@@ -178,7 +179,7 @@ module.exports = async (req, res) => {
           invoiceDetails?.billingEmail
         ) || null;
 
-      // fallback: fetch user profile if email missing
+      // fallback to user profile endpoint if still missing
       if (!email) {
         let profile = userCache.get(userId);
         if (profile === undefined) {
@@ -189,29 +190,53 @@ module.exports = async (req, res) => {
             profile = await fetchJson(url, token);
             userCache.set(userId, profile);
           } catch {
-            userFetchErrors.count++;
+            userFetchErrors++;
             profile = null;
             userCache.set(userId, null);
           }
         }
 
-        // common shapes: { email } or { data: { email } }
         email =
           pickFirstString(profile?.email, profile?.data?.email, profile?.user?.email) ||
           null;
       }
 
-      return {
-        userId,
-        email,
-        requireInvoice: false,
-        invoiceDetails,
-        sampleTransaction: u.sampleTransaction,
-      };
+      return { userId, allowed: true, email, invoiceDetails };
     });
 
-    const enriched = await runWithConcurrency(tasks, concurrency);
-    const final = enriched.filter(Boolean);
+    const userResults = await runWithConcurrency(userTasks, concurrency);
+
+    // allowlist of userIds
+    const allowedUsers = new Map(); // userId -> { email, invoiceDetails }
+    for (const r of userResults) {
+      if (r && r.allowed) {
+        allowedUsers.set(String(r.userId), {
+          email: r.email || null,
+          invoiceDetails: r.invoiceDetails || null,
+        });
+      }
+    }
+
+    // ---------- 4) Return ALL filtered transactions whose user is allowlisted ----------
+    const finalTransactions = filtered
+      .filter((t) => allowedUsers.has(String(t.userId)))
+      .map((t) => {
+        const u = allowedUsers.get(String(t.userId));
+        return {
+          // transaction fields
+          transactionId: t?.id ?? null,
+          userId: t?.userId ?? null,
+          status: t?.status ?? null,
+          totalAmount: t?.totalAmount ?? null,
+          paymentMethod: t?.paymentMethod ?? null,
+          createdAt: t?.createdAt ?? t?.created_at ?? null,
+
+          // fields your n8n needs
+          userEmail: u?.email ?? null,
+          requireInvoice: false,
+          invoiceDetails: u?.invoiceDetails ?? null,
+        };
+      });
 
     return res.status(200).json({
       ok: true,
@@ -222,17 +247,20 @@ module.exports = async (req, res) => {
 
       fetchedCount: transactions.length,
       filteredCount: filtered.length,
-      uniqueUsersAfterFilter: uniqueUsers.length,
-      requireInvoiceFalseCount: final.length,
+
+      uniqueUsersAfterFilter: userIds.length,
+      allowlistedUsers: allowedUsers.size,
+
+      requireInvoiceFalseTransactionCount: finalTransactions.length,
 
       debug: {
         paymentRegex: paymentRegex.toString(),
-        missingUserIdCount,
-        invoiceDetailsFetchErrors: invoiceFetchErrors.count,
-        userProfileFetchErrors: userFetchErrors.count,
+        filterDropReasons: reasons,
+        invoiceDetailsFetchErrors: invoiceFetchErrors,
+        userProfileFetchErrors: userFetchErrors,
       },
 
-      data: final,
+      data: finalTransactions,
     });
   } catch (err) {
     return res.status(500).json({
@@ -317,7 +345,7 @@ async function runWithConcurrency(tasks, limit) {
       const idx = i++;
       try {
         out[idx] = await tasks[idx]();
-      } catch (e) {
+      } catch {
         out[idx] = null;
       }
     }
