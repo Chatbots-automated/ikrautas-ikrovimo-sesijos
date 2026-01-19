@@ -16,6 +16,7 @@
 //    - Extract email (invoice-details -> fallback to /users/{userId})
 // 4) Return ALL filtered transactions whose userId is allowlisted
 //    + add userEmail per transaction
+//    + add transactionDate (finalizedAt -> createdAt -> lastUpdatedAt)
 //
 // ENV REQUIRED:
 // AMPECO_BASE_URL = https://cp.ikrautas.lt
@@ -222,6 +223,18 @@ module.exports = async (req, res) => {
       .filter((t) => allowedUsers.has(String(t.userId)))
       .map((t) => {
         const u = allowedUsers.get(String(t.userId));
+
+        const transactionDate = pickFirstString(
+          t?.finalizedAt,
+          t?.finalized_at,
+          t?.createdAt,
+          t?.created_at,
+          t?.lastUpdatedAt,
+          t?.last_updated_at,
+          t?.updatedAt,
+          t?.updated_at
+        );
+
         return {
           // transaction fields
           transactionId: t?.id ?? null,
@@ -229,7 +242,14 @@ module.exports = async (req, res) => {
           status: t?.status ?? null,
           totalAmount: t?.totalAmount ?? null,
           paymentMethod: t?.paymentMethod ?? null,
+
+          // ✅ the date you want
+          transactionDate: transactionDate ?? null,
+
+          // keep raw timestamps too (helpful for debugging)
           createdAt: t?.createdAt ?? t?.created_at ?? null,
+          finalizedAt: t?.finalizedAt ?? t?.finalized_at ?? null,
+          lastUpdatedAt: t?.lastUpdatedAt ?? t?.last_updated_at ?? null,
 
           // fields your n8n needs
           userEmail: u?.email ?? null,
@@ -258,6 +278,14 @@ module.exports = async (req, res) => {
         filterDropReasons: reasons,
         invoiceDetailsFetchErrors: invoiceFetchErrors,
         userProfileFetchErrors: userFetchErrors,
+
+        // if you suspect “too little”, this tells you if you hit caps
+        caps: {
+          maxPages,
+          maxItems,
+          hitMaxPages: pagesFetched >= maxPages,
+          hitMaxItems: all.length >= maxItems,
+        },
       },
 
       data: finalTransactions,
