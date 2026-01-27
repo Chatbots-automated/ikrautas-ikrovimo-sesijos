@@ -3,13 +3,21 @@
 //
 // GET /api/ampeco-transactions?createdAfter=...&createdBefore=...&per_page=100&max_pages=200&max_items=20000
 //
-// Matches your n8n flow BUT does it efficiently:
+// ✅ Now also supports fetching sessionId via per-transaction "Read" endpoint:
+//   GET /public-api/resources/transactions/v1.0/{transactionId}
 //
+// Add query param:
+//   includeSession=1   -> fetch full transaction details per transactionId and attach sessionId (+ extra fields)
+// Optional caps:
+//   details_concurrency=10
+//   max_details=5000
+//
+// Flow:
 // 1) Fetch ALL transactions for date range (cursor pagination)
 // 2) Filter transactions:
 //    - totalAmount != 0
 //    - status === "finalized"
-//    - paymentMethod matches: "<any letters> **** <4 digits>"
+//    - paymentMethod matches: "**** 1234" (regex)
 // 3) For unique userIds from filtered transactions:
 //    - GET /users/{userId}/invoice-details (cached)
 //    - Keep only users where requireInvoice === false
@@ -17,6 +25,9 @@
 // 4) Return ALL filtered transactions whose userId is allowlisted
 //    + add userEmail per transaction
 //    + add transactionDate (finalizedAt -> createdAt -> lastUpdatedAt)
+// 5) (Optional) includeSession=1:
+//    - GET /transactions/v1.0/{transactionId} for each returned transaction (concurrency limited)
+//    - attach sessionId (and keep extra useful fields)
 //
 // ENV REQUIRED:
 // AMPECO_BASE_URL = https://cp.ikrautas.lt
@@ -59,7 +70,19 @@ module.exports = async (req, res) => {
 
     const maxPages = clampInt(req.query.max_pages, 1, 500, 200);
     const maxItems = clampInt(req.query.max_items, 1, 100000, 20000);
+
     const concurrency = clampInt(req.query.concurrency, 1, 25, 10);
+
+    const includeSession =
+      String(req.query.includeSession ?? req.query.include_session ?? "0") === "1";
+
+    const detailsConcurrency = clampInt(
+      req.query.details_concurrency,
+      1,
+      25,
+      10
+    );
+    const maxDetails = clampInt(req.query.max_details, 1, 100000, 5000);
 
     // payment method regex (same intent as your n8n regex)
     const paymentRegexStr =
@@ -107,7 +130,12 @@ module.exports = async (req, res) => {
     const transactions = all.slice(0, maxItems);
 
     // ---------- 2) Filter transactions like your n8n Filter node ----------
-    const reasons = { totalZero: 0, statusNotFinal: 0, payNoMatch: 0, missingUserId: 0 };
+    const reasons = {
+      totalZero: 0,
+      statusNotFinal: 0,
+      payNoMatch: 0,
+      missingUserId: 0,
+    };
     const filtered = [];
 
     for (const t of transactions) {
@@ -219,7 +247,7 @@ module.exports = async (req, res) => {
     }
 
     // ---------- 4) Return ALL filtered transactions whose user is allowlisted ----------
-    const finalTransactions = filtered
+    let finalTransactions = filtered
       .filter((t) => allowedUsers.has(String(t.userId)))
       .map((t) => {
         const u = allowedUsers.get(String(t.userId));
@@ -232,7 +260,8 @@ module.exports = async (req, res) => {
           t?.lastUpdatedAt,
           t?.last_updated_at,
           t?.updatedAt,
-          t?.updated_at
+          t?.updated_at,
+          t?.date // some APIs use "date"
         );
 
         return {
@@ -243,7 +272,7 @@ module.exports = async (req, res) => {
           totalAmount: t?.totalAmount ?? null,
           paymentMethod: t?.paymentMethod ?? null,
 
-          // ✅ the date you want
+          // ✅ your date
           transactionDate: transactionDate ?? null,
 
           // keep raw timestamps too (helpful for debugging)
@@ -257,6 +286,74 @@ module.exports = async (req, res) => {
           invoiceDetails: u?.invoiceDetails ?? null,
         };
       });
+
+    // ---------- 5) OPTIONAL: Fetch transaction details to get sessionId ----------
+    let sessionFetchErrors = 0;
+    let sessionFetched = 0;
+    const detailsCache = new Map(); // txId -> details|null
+
+    if (includeSession) {
+      const capped = finalTransactions.slice(0, maxDetails);
+
+      const detailTasks = capped.map((t) => async () => {
+        const txId = t?.transactionId;
+        if (txId == null) return { txId: null, details: null };
+
+        const key = String(txId);
+        if (detailsCache.has(key)) return { txId: key, details: detailsCache.get(key) };
+
+        const url = `${baseUrl}/public-api/resources/transactions/v1.0/${encodeURIComponent(
+          key
+        )}`;
+
+        try {
+          const details = await fetchJson(url, token);
+          detailsCache.set(key, details);
+          sessionFetched++;
+          return { txId: key, details };
+        } catch {
+          sessionFetchErrors++;
+          detailsCache.set(key, null);
+          return { txId: key, details: null };
+        }
+      });
+
+      const detailResults = await runWithConcurrency(detailTasks, detailsConcurrency);
+
+      const byTxId = new Map();
+      for (const r of detailResults) {
+        if (!r?.txId) continue;
+        byTxId.set(String(r.txId), r.details);
+      }
+
+      // attach sessionId + useful fields
+      finalTransactions = finalTransactions.map((t) => {
+        const txId = t?.transactionId != null ? String(t.transactionId) : null;
+        const d = txId ? byTxId.get(txId) : null;
+
+        const sessionId =
+          d?.sessionId ?? d?.session_id ?? null;
+
+        // if the detail endpoint has a better date field, prefer it
+        const betterDate = pickFirstString(
+          d?.finalizedAt,
+          d?.date,
+          d?.lastUpdatedAt,
+          d?.createdAt
+        );
+
+        return {
+          ...t,
+          sessionId, // ✅ the thing you want
+          // extra detail fields (optional but often handy)
+          txNumber: d?.number ?? null,
+          ref: d?.ref ?? null,
+          purchaseResourceType: d?.purchaseResourceType ?? null,
+          purchaseResourceId: d?.purchaseResourceId ?? null,
+          transactionDate: betterDate ?? t.transactionDate ?? null,
+        };
+      });
+    }
 
     return res.status(200).json({
       ok: true,
@@ -279,12 +376,19 @@ module.exports = async (req, res) => {
         invoiceDetailsFetchErrors: invoiceFetchErrors,
         userProfileFetchErrors: userFetchErrors,
 
+        includeSession,
+        sessionFetched,
+        sessionFetchErrors,
+        detailsConcurrency,
+        maxDetails,
+
         // if you suspect “too little”, this tells you if you hit caps
         caps: {
           maxPages,
           maxItems,
           hitMaxPages: pagesFetched >= maxPages,
           hitMaxItems: all.length >= maxItems,
+          hitMaxDetails: includeSession && finalTransactions.length > maxDetails,
         },
       },
 
