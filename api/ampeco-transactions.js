@@ -3,31 +3,16 @@
 //
 // GET /api/ampeco-transactions?createdAfter=...&createdBefore=...&per_page=100&max_pages=200&max_items=20000
 //
-// ✅ Now also supports fetching sessionId via per-transaction "Read" endpoint:
-//   GET /public-api/resources/transactions/v1.0/{transactionId}
+// ✅ Robust "fetch ALL" logic:
+// - Handles relative links.next
+// - Prevents cursor loops
+// - Multi-pass sweep to catch missing records when dataset changes mid-pagination
+// - Fixes AbortController retry bug (per-attempt controller)
 //
-// Add query param:
-//   includeSession=1   -> fetch full transaction details per transactionId and attach sessionId (+ extra fields)
-// Optional caps:
+// ✅ SessionId support remains the same:
+//   includeSession=1
 //   details_concurrency=10
 //   max_details=5000
-//
-// Flow:
-// 1) Fetch ALL transactions for date range (cursor pagination)
-// 2) Filter transactions:
-//    - totalAmount != 0
-//    - status === "finalized"
-//    - paymentMethod matches: "**** 1234" (regex)
-// 3) For unique userIds from filtered transactions:
-//    - GET /users/{userId}/invoice-details (cached)
-//    - Keep only users where requireInvoice === false
-//    - Extract email (invoice-details -> fallback to /users/{userId})
-// 4) Return ALL filtered transactions whose userId is allowlisted
-//    + add userEmail per transaction
-//    + add transactionDate (finalizedAt -> createdAt -> lastUpdatedAt)
-// 5) (Optional) includeSession=1:
-//    - GET /transactions/v1.0/{transactionId} for each returned transaction (concurrency limited)
-//    - attach sessionId (and keep extra useful fields)
 //
 // ENV REQUIRED:
 // AMPECO_BASE_URL = https://cp.ikrautas.lt
@@ -68,21 +53,21 @@ module.exports = async (req, res) => {
     const createdAfter = toIsoOrDefault(req.query.createdAfter, defaultCreatedAfter);
     const createdBefore = toIsoOrDefault(req.query.createdBefore, defaultCreatedBefore);
 
-    const maxPages = clampInt(req.query.max_pages, 1, 500, 200);
-    const maxItems = clampInt(req.query.max_items, 1, 100000, 20000);
+    // hard caps (still respected)
+    const maxPages = clampInt(req.query.max_pages, 1, 2000, 200);
+    const maxItems = clampInt(req.query.max_items, 1, 200000, 20000);
 
     const concurrency = clampInt(req.query.concurrency, 1, 25, 10);
 
     const includeSession =
       String(req.query.includeSession ?? req.query.include_session ?? "0") === "1";
 
-    const detailsConcurrency = clampInt(
-      req.query.details_concurrency,
-      1,
-      25,
-      10
-    );
-    const maxDetails = clampInt(req.query.max_details, 1, 100000, 5000);
+    const detailsConcurrency = clampInt(req.query.details_concurrency, 1, 25, 10);
+    const maxDetails = clampInt(req.query.max_details, 1, 200000, 5000);
+
+    // How many full sweeps to do to avoid "missing 5-10" due to live dataset.
+    // 2 is usually enough; 3 if you want to be paranoid.
+    const sweepPasses = clampInt(req.query.sweep_passes, 1, 5, 3);
 
     // payment method regex (same intent as your n8n regex)
     const paymentRegexStr =
@@ -97,7 +82,7 @@ module.exports = async (req, res) => {
       paymentRegex = /.*\*{4}\s*\d{4}\b/;
     }
 
-    // ---------- 1) Fetch all transactions (cursor pagination) ----------
+    // ---------- 1) Fetch ALL transactions (cursor pagination, sweep) ----------
     const firstUrl =
       `${baseUrl}/public-api/resources/transactions/v1.0` +
       `?filter[createdAfter]=${encodeURIComponent(createdAfter)}` +
@@ -105,29 +90,77 @@ module.exports = async (req, res) => {
       `&per_page=${encodeURIComponent(String(perPage))}` +
       `&cursor`;
 
-    let nextUrl = firstUrl;
-    let pagesFetched = 0;
-    const all = [];
+    const fetchDebug = {
+      pagesFetchedTotal: 0,
+      passes: [],
+      hitMaxPages: false,
+      hitMaxItems: false,
+      loopBreaks: 0,
+    };
 
-    while (nextUrl && pagesFetched < maxPages && all.length < maxItems) {
-      pagesFetched++;
+    // Use a map to dedupe transactions across sweeps by transaction id
+    const byId = new Map(); // id -> transactionRow
 
-      const json = await fetchJson(nextUrl, token);
+    for (let pass = 1; pass <= sweepPasses; pass++) {
+      let nextUrl = firstUrl;
+      let pagesFetchedThisPass = 0;
+      let addedThisPass = 0;
 
-      const rows = Array.isArray(json?.data) ? json.data : [];
-      all.push(...rows);
+      // Avoid infinite loops if API returns the same next cursor again
+      const seenNextUrls = new Set();
 
-      // cursor pagination: usually links.next
-      nextUrl =
-        (json?.links && typeof json.links.next === "string" && json.links.next) ||
-        (json?.links && typeof json.links.next_url === "string" && json.links.next_url) ||
-        (typeof json?.next_url === "string" && json.next_url) ||
-        null;
+      while (nextUrl && pagesFetchedThisPass < maxPages && byId.size < maxItems) {
+        pagesFetchedThisPass++;
+        fetchDebug.pagesFetchedTotal++;
 
-      if (!nextUrl) break;
+        // loop detection
+        const loopKey = String(nextUrl);
+        if (seenNextUrls.has(loopKey)) {
+          fetchDebug.loopBreaks++;
+          break;
+        }
+        seenNextUrls.add(loopKey);
+
+        const json = await fetchJson(nextUrl, token);
+
+        const rows = Array.isArray(json?.data) ? json.data : [];
+        for (const r of rows) {
+          const id = r?.id;
+          if (id == null) continue;
+          const key = String(id);
+          if (!byId.has(key)) {
+            byId.set(key, r);
+            addedThisPass++;
+            if (byId.size >= maxItems) break;
+          }
+        }
+
+        const rawNext =
+          (json?.links && typeof json.links.next === "string" && json.links.next) ||
+          (json?.links && typeof json.links.next_url === "string" && json.links.next_url) ||
+          (typeof json?.next_url === "string" && json.next_url) ||
+          null;
+
+        nextUrl = normalizeNextUrl(rawNext, baseUrl);
+
+        if (!nextUrl) break;
+      }
+
+      if (pagesFetchedThisPass >= maxPages) fetchDebug.hitMaxPages = true;
+      if (byId.size >= maxItems) fetchDebug.hitMaxItems = true;
+
+      fetchDebug.passes.push({
+        pass,
+        pagesFetchedThisPass,
+        addedThisPass,
+        totalUniqueSoFar: byId.size,
+      });
+
+      // If a pass added 0 new ids, we’re stable -> stop early
+      if (addedThisPass === 0) break;
     }
 
-    const transactions = all.slice(0, maxItems);
+    const transactions = Array.from(byId.values());
 
     // ---------- 2) Filter transactions like your n8n Filter node ----------
     const reasons = {
@@ -261,26 +294,22 @@ module.exports = async (req, res) => {
           t?.last_updated_at,
           t?.updatedAt,
           t?.updated_at,
-          t?.date // some APIs use "date"
+          t?.date
         );
 
         return {
-          // transaction fields
           transactionId: t?.id ?? null,
           userId: t?.userId ?? null,
           status: t?.status ?? null,
           totalAmount: t?.totalAmount ?? null,
           paymentMethod: t?.paymentMethod ?? null,
 
-          // ✅ your date
           transactionDate: transactionDate ?? null,
 
-          // keep raw timestamps too (helpful for debugging)
           createdAt: t?.createdAt ?? t?.created_at ?? null,
           finalizedAt: t?.finalizedAt ?? t?.finalized_at ?? null,
           lastUpdatedAt: t?.lastUpdatedAt ?? t?.last_updated_at ?? null,
 
-          // fields your n8n needs
           userEmail: u?.email ?? null,
           requireInvoice: false,
           invoiceDetails: u?.invoiceDetails ?? null,
@@ -326,15 +355,12 @@ module.exports = async (req, res) => {
         byTxId.set(String(r.txId), r.details);
       }
 
-      // attach sessionId + useful fields
       finalTransactions = finalTransactions.map((t) => {
         const txId = t?.transactionId != null ? String(t.transactionId) : null;
         const d = txId ? byTxId.get(txId) : null;
 
-        const sessionId =
-          d?.sessionId ?? d?.session_id ?? null;
+        const sessionId = d?.sessionId ?? d?.session_id ?? null;
 
-        // if the detail endpoint has a better date field, prefer it
         const betterDate = pickFirstString(
           d?.finalizedAt,
           d?.date,
@@ -344,8 +370,7 @@ module.exports = async (req, res) => {
 
         return {
           ...t,
-          sessionId, // ✅ the thing you want
-          // extra detail fields (optional but often handy)
+          sessionId,
           txNumber: d?.number ?? null,
           ref: d?.ref ?? null,
           purchaseResourceType: d?.purchaseResourceType ?? null,
@@ -360,7 +385,6 @@ module.exports = async (req, res) => {
       createdAfter,
       createdBefore,
       per_page: perPage,
-      pagesFetched,
 
       fetchedCount: transactions.length,
       filteredCount: filtered.length,
@@ -382,12 +406,13 @@ module.exports = async (req, res) => {
         detailsConcurrency,
         maxDetails,
 
-        // if you suspect “too little”, this tells you if you hit caps
+        fetchAll: fetchDebug,
+
         caps: {
           maxPages,
           maxItems,
-          hitMaxPages: pagesFetched >= maxPages,
-          hitMaxItems: all.length >= maxItems,
+          hitMaxPages: fetchDebug.hitMaxPages,
+          hitMaxItems: fetchDebug.hitMaxItems,
           hitMaxDetails: includeSession && finalTransactions.length > maxDetails,
         },
       },
@@ -425,12 +450,21 @@ function pickFirstString(...vals) {
   return null;
 }
 
-async function fetchJson(url, token) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 25000);
+function normalizeNextUrl(nextUrl, baseUrl) {
+  if (!nextUrl) return null;
+  const s = String(nextUrl).trim();
+  if (!s) return null;
+  if (s.startsWith("http://") || s.startsWith("https://")) return s;
+  if (s.startsWith("/")) return `${baseUrl}${s}`;
+  return `${baseUrl}/${s}`;
+}
 
-  try {
-    for (let attempt = 1; attempt <= 4; attempt++) {
+async function fetchJson(url, token) {
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 25000);
+
+    try {
       const r = await fetch(url, {
         method: "GET",
         headers: {
@@ -456,12 +490,12 @@ async function fetchJson(url, token) {
       }
 
       await sleep(300 * attempt);
+    } finally {
+      clearTimeout(timeout);
     }
-
-    throw new Error("Unexpected fetchJson fallthrough");
-  } finally {
-    clearTimeout(timeout);
   }
+
+  throw new Error("Unexpected fetchJson fallthrough");
 }
 
 function sleep(ms) {
