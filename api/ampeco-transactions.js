@@ -14,6 +14,11 @@
 //   details_concurrency=10
 //   max_details=5000
 //
+// ✅ LT time (Europe/Vilnius, GMT+2/+3 DST):
+// - Response adds LT versions of all timestamps:
+//   transactionDateLt, createdAtLt, finalizedAtLt, lastUpdatedAtLt
+// - Also if you omit createdAfter/createdBefore, defaults are computed in LT time
+//
 // ENV REQUIRED:
 // AMPECO_BASE_URL = https://cp.ikrautas.lt
 // AMPECO_TOKEN    = <Bearer token>
@@ -42,13 +47,21 @@ module.exports = async (req, res) => {
     // ---------- query params ----------
     const perPage = clampInt(req.query.per_page, 1, 100, 100);
 
+    // Defaults computed in LT time (Europe/Vilnius), then converted to ISO (UTC) for API filters
     const now = new Date();
-    const defaultCreatedAfter = new Date(
-      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0)
-    ).toISOString();
-    const defaultCreatedBefore = new Date(
-      Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1, 0, 0, 0)
-    ).toISOString();
+    const ltNowParts = getTimeZoneParts(now, "Europe/Vilnius");
+    const ltYear = ltNowParts.year;
+    const ltMonth = ltNowParts.month; // 1-12
+
+    const defaultCreatedAfter = makeLtLocalIsoUtc(ltYear, ltMonth, 1, 0, 0, 0); // LT start of month
+    const defaultCreatedBefore = makeLtLocalIsoUtc(
+      ltMonth === 12 ? ltYear + 1 : ltYear,
+      ltMonth === 12 ? 1 : ltMonth + 1,
+      1,
+      0,
+      0,
+      0
+    ); // LT start of next month
 
     const createdAfter = toIsoOrDefault(req.query.createdAfter, defaultCreatedAfter);
     const createdBefore = toIsoOrDefault(req.query.createdBefore, defaultCreatedBefore);
@@ -66,7 +79,6 @@ module.exports = async (req, res) => {
     const maxDetails = clampInt(req.query.max_details, 1, 200000, 5000);
 
     // How many full sweeps to do to avoid "missing 5-10" due to live dataset.
-    // 2 is usually enough; 3 if you want to be paranoid.
     const sweepPasses = clampInt(req.query.sweep_passes, 1, 5, 3);
 
     // payment method regex (same intent as your n8n regex)
@@ -96,9 +108,10 @@ module.exports = async (req, res) => {
       hitMaxPages: false,
       hitMaxItems: false,
       loopBreaks: 0,
+      tz: "Europe/Vilnius",
     };
 
-    // Use a map to dedupe transactions across sweeps by transaction id
+    // Dedupe across sweeps by transaction id
     const byId = new Map(); // id -> transactionRow
 
     for (let pass = 1; pass <= sweepPasses; pass++) {
@@ -106,14 +119,13 @@ module.exports = async (req, res) => {
       let pagesFetchedThisPass = 0;
       let addedThisPass = 0;
 
-      // Avoid infinite loops if API returns the same next cursor again
+      // Avoid infinite loops if API returns same next cursor again
       const seenNextUrls = new Set();
 
       while (nextUrl && pagesFetchedThisPass < maxPages && byId.size < maxItems) {
         pagesFetchedThisPass++;
         fetchDebug.pagesFetchedTotal++;
 
-        // loop detection
         const loopKey = String(nextUrl);
         if (seenNextUrls.has(loopKey)) {
           fetchDebug.loopBreaks++;
@@ -142,7 +154,6 @@ module.exports = async (req, res) => {
           null;
 
         nextUrl = normalizeNextUrl(rawNext, baseUrl);
-
         if (!nextUrl) break;
       }
 
@@ -162,7 +173,7 @@ module.exports = async (req, res) => {
 
     const transactions = Array.from(byId.values());
 
-    // ---------- 2) Filter transactions like your n8n Filter node ----------
+    // ---------- 2) Filter transactions (unchanged) ----------
     const reasons = {
       totalZero: 0,
       statusNotFinal: 0,
@@ -197,17 +208,15 @@ module.exports = async (req, res) => {
       filtered.push(t);
     }
 
-    // ---------- 3) Build unique userId set from filtered transactions ----------
+    // ---------- 3) Build unique userId set ----------
     const userIds = [...new Set(filtered.map((t) => String(t.userId)))];
 
-    // caches
     const invoiceCache = new Map(); // userId -> invoiceDetails|null
     const userCache = new Map(); // userId -> userProfile|null
 
     let invoiceFetchErrors = 0;
     let userFetchErrors = 0;
 
-    // fetch invoice-details for each unique userId (concurrently)
     const userTasks = userIds.map((userId) => async () => {
       // invoice-details
       let invoiceDetails = invoiceCache.get(userId);
@@ -227,12 +236,10 @@ module.exports = async (req, res) => {
 
       const requireInvoice = invoiceDetails?.requireInvoice;
 
-      // only allow requireInvoice === false (same as your Filter1)
       if (requireInvoice !== false) {
         return { userId, allowed: false, email: null, invoiceDetails };
       }
 
-      // email from invoiceDetails (try several keys)
       let email =
         pickFirstString(
           invoiceDetails?.email,
@@ -241,7 +248,6 @@ module.exports = async (req, res) => {
           invoiceDetails?.billingEmail
         ) || null;
 
-      // fallback to user profile endpoint if still missing
       if (!email) {
         let profile = userCache.get(userId);
         if (profile === undefined) {
@@ -268,8 +274,7 @@ module.exports = async (req, res) => {
 
     const userResults = await runWithConcurrency(userTasks, concurrency);
 
-    // allowlist of userIds
-    const allowedUsers = new Map(); // userId -> { email, invoiceDetails }
+    const allowedUsers = new Map();
     for (const r of userResults) {
       if (r && r.allowed) {
         allowedUsers.set(String(r.userId), {
@@ -297,6 +302,10 @@ module.exports = async (req, res) => {
           t?.date
         );
 
+        const createdAt = t?.createdAt ?? t?.created_at ?? null;
+        const finalizedAt = t?.finalizedAt ?? t?.finalized_at ?? null;
+        const lastUpdatedAt = t?.lastUpdatedAt ?? t?.last_updated_at ?? null;
+
         return {
           transactionId: t?.id ?? null,
           userId: t?.userId ?? null,
@@ -304,11 +313,17 @@ module.exports = async (req, res) => {
           totalAmount: t?.totalAmount ?? null,
           paymentMethod: t?.paymentMethod ?? null,
 
+          // UTC/offset timestamps (as received)
           transactionDate: transactionDate ?? null,
+          createdAt,
+          finalizedAt,
+          lastUpdatedAt,
 
-          createdAt: t?.createdAt ?? t?.created_at ?? null,
-          finalizedAt: t?.finalizedAt ?? t?.finalized_at ?? null,
-          lastUpdatedAt: t?.lastUpdatedAt ?? t?.last_updated_at ?? null,
+          // ✅ LT time ISO strings (Europe/Vilnius)
+          transactionDateLt: toLtIso(transactionDate),
+          createdAtLt: toLtIso(createdAt),
+          finalizedAtLt: toLtIso(finalizedAt),
+          lastUpdatedAtLt: toLtIso(lastUpdatedAt),
 
           userEmail: u?.email ?? null,
           requireInvoice: false,
@@ -319,7 +334,7 @@ module.exports = async (req, res) => {
     // ---------- 5) OPTIONAL: Fetch transaction details to get sessionId ----------
     let sessionFetchErrors = 0;
     let sessionFetched = 0;
-    const detailsCache = new Map(); // txId -> details|null
+    const detailsCache = new Map();
 
     if (includeSession) {
       const capped = finalTransactions.slice(0, maxDetails);
@@ -368,6 +383,8 @@ module.exports = async (req, res) => {
           d?.createdAt
         );
 
+        const betterDateLt = toLtIso(betterDate) ?? t.transactionDateLt ?? null;
+
         return {
           ...t,
           sessionId,
@@ -375,7 +392,14 @@ module.exports = async (req, res) => {
           ref: d?.ref ?? null,
           purchaseResourceType: d?.purchaseResourceType ?? null,
           purchaseResourceId: d?.purchaseResourceId ?? null,
+
           transactionDate: betterDate ?? t.transactionDate ?? null,
+          transactionDateLt: betterDateLt,
+
+          // also provide LT versions if detail endpoint returned better raw fields
+          finalizedAtLt: toLtIso(d?.finalizedAt) ?? t.finalizedAtLt ?? null,
+          createdAtLt: toLtIso(d?.createdAt) ?? t.createdAtLt ?? null,
+          lastUpdatedAtLt: toLtIso(d?.lastUpdatedAt) ?? t.lastUpdatedAtLt ?? null,
         };
       });
     }
@@ -407,6 +431,9 @@ module.exports = async (req, res) => {
         maxDetails,
 
         fetchAll: fetchDebug,
+
+        // LT info
+        timeZone: "Europe/Vilnius",
 
         caps: {
           maxPages,
@@ -457,6 +484,95 @@ function normalizeNextUrl(nextUrl, baseUrl) {
   if (s.startsWith("http://") || s.startsWith("https://")) return s;
   if (s.startsWith("/")) return `${baseUrl}${s}`;
   return `${baseUrl}/${s}`;
+}
+
+// Convert any parseable datetime string to an ISO-like string in Europe/Vilnius.
+// Output format: YYYY-MM-DDTHH:mm:ss+02:00 / +03:00 (DST aware)
+function toLtIso(value) {
+  if (!value) return null;
+  const d = new Date(String(value));
+  if (Number.isNaN(d.getTime())) return null;
+  return formatInTimeZoneIso(d, "Europe/Vilnius");
+}
+
+// Returns {year, month, day, hour, minute, second} in a timezone (numbers)
+function getTimeZoneParts(date, timeZone) {
+  const dtf = new Intl.DateTimeFormat("en-GB", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+  const parts = dtf.formatToParts(date);
+  const map = {};
+  for (const p of parts) {
+    if (p.type !== "literal") map[p.type] = p.value;
+  }
+  return {
+    year: Number(map.year),
+    month: Number(map.month),
+    day: Number(map.day),
+    hour: Number(map.hour),
+    minute: Number(map.minute),
+    second: Number(map.second),
+  };
+}
+
+// Build a UTC ISO string that represents "local time in Europe/Vilnius" at Y-M-D h:m:s.
+// Used for defaultCreatedAfter/defaultCreatedBefore.
+function makeLtLocalIsoUtc(year, month, day, hour, minute, second) {
+  // Start with a UTC date at the same wall-clock values, then shift by timezone offset at that moment.
+  const approxUtc = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+
+  // Compute actual offset for Europe/Vilnius at that moment:
+  const ltParts = getTimeZoneParts(approxUtc, "Europe/Vilnius");
+  const ltAsIfUtc = Date.UTC(
+    ltParts.year,
+    ltParts.month - 1,
+    ltParts.day,
+    ltParts.hour,
+    ltParts.minute,
+    ltParts.second
+  );
+  const approx = approxUtc.getTime();
+  const offsetMs = ltAsIfUtc - approx; // difference between tz wall clock and UTC wall clock
+  const trueUtc = new Date(approxUtc.getTime() - offsetMs);
+  return trueUtc.toISOString();
+}
+
+// Format date as ISO-like string in timezone with numeric offset (+02:00/+03:00).
+function formatInTimeZoneIso(date, timeZone) {
+  const parts = getTimeZoneParts(date, timeZone);
+
+  // We need offset. Compute offset by comparing tz wall-clock interpreted as UTC vs real UTC time.
+  const tzAsIfUtcMs = Date.UTC(
+    parts.year,
+    parts.month - 1,
+    parts.day,
+    parts.hour,
+    parts.minute,
+    parts.second
+  );
+  const realUtcMs = date.getTime();
+  const offsetMin = Math.round((tzAsIfUtcMs - realUtcMs) / 60000); // e.g., +120 / +180
+
+  const sign = offsetMin >= 0 ? "+" : "-";
+  const abs = Math.abs(offsetMin);
+  const hh = String(Math.floor(abs / 60)).padStart(2, "0");
+  const mm = String(abs % 60).padStart(2, "0");
+
+  const Y = String(parts.year).padStart(4, "0");
+  const M = String(parts.month).padStart(2, "0");
+  const D = String(parts.day).padStart(2, "0");
+  const h = String(parts.hour).padStart(2, "0");
+  const m = String(parts.minute).padStart(2, "0");
+  const s = String(parts.second).padStart(2, "0");
+
+  return `${Y}-${M}-${D}T${h}:${m}:${s}${sign}${hh}:${mm}`;
 }
 
 async function fetchJson(url, token) {
